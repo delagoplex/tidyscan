@@ -194,6 +194,7 @@ fn move_to_target_and_name_collisions() {
             size: 1,
             kind: ActionKind::MoveTo("Archiv".into()),
             reason: "t".into(),
+            guard: None,
         });
     }
     let rep = actions::execute(&plan, false).unwrap();
@@ -206,4 +207,35 @@ fn move_to_target_and_name_collisions() {
     assert_eq!(undo.restored, 2);
     assert_eq!(fs::read(fx.root().join("x/report.pdf")).unwrap(), b"1");
     assert_eq!(fs::read(fx.root().join("y/report.pdf")).unwrap(), b"2");
+}
+
+#[test]
+fn guard_skips_changed_files_and_missing_keep_copy() {
+    let fx = Fixture::new();
+    let a = fx.file("a.txt", b"aaaa");
+    let b = fx.file("b.txt", b"bbbb");
+    let keep = fx.file("keep.txt", b"bbbb");
+    let r = scan_simple(&fx.root(), &ScanOptions::default()).unwrap();
+    let fa = r.files.iter().find(|f| f.name() == "a.txt").unwrap();
+    let fb = r.files.iter().find(|f| f.name() == "b.txt").unwrap();
+
+    let mut plan = Plan::new(r.root.clone());
+    let mut act_a = quarantine_action(a.clone(), false, fa.size, "t");
+    act_a.guard = Some(actions::Guard::for_file(fa));
+    let mut act_b = quarantine_action(b.clone(), false, fb.size, "dupe");
+    act_b.guard = Some(actions::Guard::for_file(fb).with_keep(keep.clone()));
+    plan.push(act_a);
+    plan.push(act_b);
+
+    // The world changes after the scan: a grows, the keep copy of b disappears.
+    fs::write(&a, b"aaaa-changed").unwrap();
+    fs::remove_file(&keep).unwrap();
+
+    let rep = actions::execute(&plan, false).unwrap();
+    assert_eq!(rep.moved, 0);
+    assert_eq!(rep.failed.len(), 2);
+    assert!(a.exists() && b.exists(), "nothing was moved");
+    let reasons: Vec<&str> = rep.failed.iter().map(|(_, m)| m.as_str()).collect();
+    assert!(reasons.iter().any(|m| m.contains("verändert")));
+    assert!(reasons.iter().any(|m| m.contains("Original-Kopie fehlt")));
 }

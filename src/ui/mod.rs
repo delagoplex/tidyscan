@@ -1,5 +1,6 @@
 //! egui front-end. All heavy work runs on background threads; the UI only polls.
 
+mod auto;
 mod cleanup;
 mod lists;
 mod overview;
@@ -26,6 +27,7 @@ pub enum Tab {
     Old,
     Dupes,
     Empty,
+    Auto,
     Cleanup,
 }
 
@@ -94,6 +96,7 @@ pub fn file_action(result: &ScanResult, id: FileId, reason: &str) -> Action {
         size: f.size,
         kind: ActionKind::Quarantine,
         reason: reason.to_string(),
+        guard: None,
     }
 }
 
@@ -104,6 +107,7 @@ pub fn dir_action(result: &ScanResult, id: DirId, reason: &str) -> Action {
         size: 0,
         kind: ActionKind::Quarantine,
         reason: reason.to_string(),
+        guard: None,
     }
 }
 
@@ -120,6 +124,9 @@ pub struct App {
     pub(crate) error: Option<String>,
     /// Start a scan on the first frame (set when a folder was passed on the command line).
     auto_scan: bool,
+    /// Development hook: `TIDYSCAN_AUTO=quarantine|organize` computes that proposal
+    /// right after the first scan and opens the Automatik tab.
+    auto_after_scan: Option<auto::Mode>,
 
     // Overview
     pub(crate) selected_dir: DirId,
@@ -150,11 +157,19 @@ pub struct App {
     pub(crate) confirm_execute: bool,
     pub(crate) last_report: Option<String>,
     pub(crate) journals: Vec<PathBuf>,
+
+    // Automatik
+    pub(crate) auto: auto::AutoState,
 }
 
 impl App {
     fn new(_cc: &eframe::CreationContext<'_>, preset: Option<PathBuf>) -> Self {
         let auto_scan = preset.is_some();
+        let auto_after_scan = match std::env::var("TIDYSCAN_AUTO").as_deref() {
+            Ok("quarantine") => Some(auto::Mode::Quarantine),
+            Ok("organize") => Some(auto::Mode::Organize),
+            _ => None,
+        };
         let root_text = preset
             .or_else(dirs::download_dir)
             .or_else(dirs::home_dir)
@@ -172,6 +187,7 @@ impl App {
             status: "Ordner wählen und Scan starten.".into(),
             error: None,
             auto_scan,
+            auto_after_scan,
             selected_dir: 0,
             detail_cache: None,
             old_days: 365,
@@ -193,6 +209,7 @@ impl App {
             confirm_execute: false,
             last_report: None,
             journals: Vec::new(),
+            auto: auto::AutoState::new(),
         }
     }
 
@@ -234,6 +251,7 @@ impl App {
         self.dupes = None;
         self.selection.clear();
         self.last_report = None;
+        self.auto.reset();
         self.status = format!("Scanne {} …", root.display());
 
         let opts = self.scan_options();
@@ -290,6 +308,10 @@ impl App {
                     self.old_dirty = true;
                     self.old_filter_applied = None;
                     self.result = Some(Arc::new(r));
+                    if let Some(mode) = self.auto_after_scan.take() {
+                        self.tab = Tab::Auto;
+                        auto::start(self, mode);
+                    }
                 }
                 Err(e) => {
                     self.error = Some(format!("Scan fehlgeschlagen: {e:#}"));
@@ -311,14 +333,15 @@ impl App {
     }
 
     pub(crate) fn start_dupes(&mut self) {
+        match crate::rules::parse_size(&self.dupe_min_size) {
+            Ok(m) => self.start_dupes_min(m),
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    /// Run the duplicate search in the background with an explicit minimum size.
+    pub(crate) fn start_dupes_min(&mut self, min: u64) {
         let Some(r) = &self.result else { return };
-        let min = match crate::rules::parse_size(&self.dupe_min_size) {
-            Ok(m) => m,
-            Err(e) => {
-                self.error = Some(e.to_string());
-                return;
-            }
-        };
         self.error = None;
         let r = r.clone();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -359,6 +382,35 @@ impl App {
                 j.counters.1.load(Ordering::Relaxed),
             )
         })
+    }
+
+    /// Execute a plan, report, and rescan. Shared by the Aufräumen and Automatik tabs.
+    pub(crate) fn execute_plan(&mut self, plan: Plan) {
+        let msg = match crate::actions::execute(&plan, false) {
+            Ok(rep) => {
+                let mut m = format!(
+                    "{} Einträge verschoben ({}), {} übersprungen.",
+                    rep.moved,
+                    human(rep.bytes),
+                    rep.failed.len()
+                );
+                for (p, e) in rep.failed.iter().take(15) {
+                    m.push_str(&format!("\n  {}: {e}", p.display()));
+                }
+                if rep.failed.len() > 15 {
+                    m.push_str(&format!("\n  … und {} weitere", rep.failed.len() - 15));
+                }
+                if let Some(j) = rep.journal_path {
+                    m.push_str(&format!("\nJournal: {}", j.display()));
+                }
+                m
+            }
+            Err(e) => format!("Ausführen fehlgeschlagen: {e:#}"),
+        };
+        self.selection.clear();
+        self.start_scan();
+        self.last_report = Some(msg);
+        self.journals = crate::actions::list_journals(&self.root());
     }
 
     pub(crate) fn pick_folder(&mut self) {
@@ -448,7 +500,8 @@ impl eframe::App for App {
         }
         self.poll_scan();
         self.poll_dupes();
-        if self.scanning() || self.dupes_running() {
+        auto::poll(self);
+        if self.scanning() || self.dupes_running() || self.auto.busy() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
@@ -463,6 +516,7 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.tab, Tab::Old, "Alte Dateien");
                 ui.selectable_value(&mut self.tab, Tab::Dupes, "Duplikate");
                 ui.selectable_value(&mut self.tab, Tab::Empty, "Leere Ordner");
+                ui.selectable_value(&mut self.tab, Tab::Auto, "Automatik");
                 let label = if self.selection.is_empty() {
                     "Aufräumen".to_string()
                 } else {
@@ -488,6 +542,7 @@ impl eframe::App for App {
                 Tab::Old => lists::show_old(self, ui),
                 Tab::Dupes => lists::show_dupes(self, ui),
                 Tab::Empty => lists::show_empty(self, ui),
+                Tab::Auto => auto::show(self, ui, &ctx),
                 Tab::Cleanup => cleanup::show(self, ui, &ctx),
             }
         });

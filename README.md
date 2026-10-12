@@ -38,9 +38,23 @@ tidyscan gui ~/Downloads
 
 Links Ordner wählen und scannen. Die Tabs **Übersicht**, **Alte Dateien**, **Duplikate** und **Leere Ordner** zeigen die Ergebnisse. Häkchen setzen füllt den Plan im Tab **Aufräumen**. Dort lassen sich außerdem Regeldateien anwenden, der Plan ausführen und frühere Sitzungen rückgängig machen.
 
+## Automatik
+
+Der Tab **Automatik** (CLI: `auto` und `organize`) berechnet mit einem Klick einen Vorschlag und führt ihn erst nach einem zweiten Klick aus. Jeder Eintrag ist entweder **sicher**, **unsicher** oder **geschützt**:
+
+- **Sicher** wird ohne Nachfrage erledigt: Müll- und Temporärdateien (Thumbs.db, .DS_Store, *.tmp, Office-Sperrdateien älter als ein Tag, abgebrochene Downloads älter als eine Woche), 0-Byte-Dateien, exakte Duplikate außerhalb von Projekten (eine Kopie bleibt, bevorzugt die außerhalb von Downloads), leere Ordner älter als eine Woche, alte Installer in Downloads (ab 90 Tagen) und Archive, neben denen bereits der entpackte Ordner liegt.
+- **Unsicher** wird mit Begründung gelistet, du entscheidest per Häkchen. **Nachprüfen** liefert zusätzliche Hinweise: ob eine Datei gerade geöffnet ist, ob sie sich seit dem Scan verändert hat, ob die erhaltene Duplikat-Kopie wirklich noch byte-identisch ist, ob ein entpackter Ordner existiert. Was die Prüfung besteht, rutscht in die sichere Liste.
+- **Geschützt** wird nie angefasst: Projektordner (Git, Cargo, npm, Python, Unity, …), `node_modules`, `.git`, Spiele-Bibliotheken, Programm- und Systemordner, AppData.
+
+Die **Sortier-Automatik** räumt lose Dateien nach Kategorie in `Bilder/`, `Videos/`, `Audio/`, `Dokumente/`, `Archive/`, `Installer/`, `Disk-Images/` (bestehende Ordner wie `Pictures` oder `Documents` werden als Ziel erkannt, optional mit Jahres-Unterordner). Zusammenhängende Unterordner (mindestens 80 % eine Kategorie) wandern als Ganzes unter ihren Kategorie-Ordner, gemischte Unterordner werden nur als Vorschlag zum Verteilen gezeigt. Begleitdateien wie `foto.jpg` + `foto.xmp` bleiben zusammen, Code, Verknüpfungen und Unbekanntes werden nicht verschoben. Eine Vorher/Nachher-Ansicht zeigt die Struktur, bevor etwas passiert.
+
+Vor jedem Verschieben prüft tidyscan erneut, ob die Datei seit dem Scan unverändert ist und ob die erhaltene Duplikat-Kopie noch existiert. Alles landet wie gewohnt in der Quarantäne bzw. im Zielordner und ist über das Journal rückgängig machbar.
+
 ## CLI
 
 ```bash
+tidyscan auto <pfad> [--apply] [--include-unsure] [--no-dupes] [--json]
+tidyscan organize <pfad> [--by-year] [--apply] [--include-unsure] [--json]
 tidyscan scan <pfad> [--top 20] [--json]
 tidyscan old <pfad> --days 365 [--use-atime]
 tidyscan dupes <pfad> [--min-size 1M]

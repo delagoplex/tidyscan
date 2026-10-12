@@ -11,10 +11,13 @@ use clap::{Args, Parser, Subcommand};
 use crate::actions::{self, Action, ActionKind, Plan};
 use crate::age::{self, AgeBasis};
 use crate::analysis::{self, Category, human};
+use crate::context;
 use crate::dupes;
 use crate::model::ScanResult;
+use crate::organize::{self, AfterTree, FolderVerdict, OrganizeOptions, OrganizePlan};
 use crate::rules;
 use crate::scan::{self, ScanOptions};
+use crate::triage::{self, Candidate, Triage, TriageOptions};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -134,6 +137,38 @@ pub enum Command {
         /// Scan-Root, dessen neueste Quarantäne-Sitzung zurückgenommen wird
         #[arg(long)]
         root: Option<PathBuf>,
+    },
+    /// Automatik: alles Sichere in Quarantäne, Unsicheres nur auflisten. Ohne --apply Vorschau.
+    Auto {
+        #[command(flatten)]
+        scan: ScanArgs,
+        /// Wirklich verschieben
+        #[arg(long)]
+        apply: bool,
+        /// Auch die unsicheren Einträge verschieben (ausdrückliche Entscheidung)
+        #[arg(long)]
+        include_unsure: bool,
+        /// Duplikatsuche überspringen (schneller)
+        #[arg(long)]
+        no_dupes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Sortier-Automatik: lose Dateien und zusammenhängende Ordner nach Kategorie einsortieren
+    Organize {
+        #[command(flatten)]
+        scan: ScanArgs,
+        /// Jahres-Unterordner anlegen (Bilder/2024/…)
+        #[arg(long)]
+        by_year: bool,
+        /// Wirklich verschieben
+        #[arg(long)]
+        apply: bool,
+        /// Auch die unsicheren Einträge verschieben
+        #[arg(long)]
+        include_unsure: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Beispiel-Regeldatei ausgeben
     ExampleRules,
@@ -314,6 +349,78 @@ pub fn run(cli: Cli) -> anyhow::Result<Option<Option<PathBuf>>> {
                 println!("    KONFLIKT {}: {e}", p.display());
             }
         }
+        Some(Command::Auto {
+            scan,
+            apply,
+            include_unsure,
+            no_dupes,
+            json,
+        }) => {
+            let result = scan.run()?;
+            let ctx = context::build(&result);
+            let groups = if no_dupes {
+                None
+            } else {
+                Some(dupes::find_duplicates(
+                    &result,
+                    1,
+                    Arc::new(AtomicBool::new(false)),
+                    None,
+                ))
+            };
+            let t = triage::assess(
+                &result,
+                &ctx,
+                groups.as_deref(),
+                &TriageOptions::default(),
+                now,
+            );
+            if json {
+                println!("{}", serde_json::to_string_pretty(&t)?);
+                return Ok(None);
+            }
+            for n in &t.notes {
+                println!("{n}");
+            }
+            print_candidates("Sicher (wird verschoben)", &t.safe, &result);
+            print_candidates("Unsicher (bitte entscheiden)", &t.unsure, &result);
+            if t.protected > 0 {
+                println!(
+                    "\n{} Einträge in geschützten Bereichen übersprungen.",
+                    t.protected
+                );
+            }
+            let plan = t.to_plan(&result.root, include_unsure);
+            finish_auto(&plan, apply)?;
+        }
+        Some(Command::Organize {
+            scan,
+            by_year,
+            apply,
+            include_unsure,
+            json,
+        }) => {
+            let result = scan.run()?;
+            let ctx = context::build(&result);
+            let opts = OrganizeOptions {
+                by_year,
+                ..Default::default()
+            };
+            let p = organize::plan_organize(&result, &ctx, &opts, now);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&p)?);
+                return Ok(None);
+            }
+            for n in &p.notes {
+                println!("{n}");
+            }
+            print_profiles(&p, &result);
+            print_candidates("Sicher (wird verschoben)", &p.safe, &result);
+            print_candidates("Unsicher (bitte entscheiden)", &p.unsure, &result);
+            print_after(&p.after);
+            let plan = p.to_plan(&result.root, include_unsure);
+            finish_auto(&plan, apply)?;
+        }
         Some(Command::ExampleRules) => print!("{}", rules::EXAMPLE_RULES),
     }
     Ok(None)
@@ -460,5 +567,117 @@ pub fn quarantine_action(source: PathBuf, is_dir: bool, size: u64, reason: &str)
         size,
         kind: ActionKind::Quarantine,
         reason: reason.to_string(),
+        guard: None,
     }
+}
+
+fn print_candidates(title: &str, list: &[Candidate], result: &ScanResult) {
+    let bytes: u64 = list.iter().map(Candidate::size).sum();
+    println!("\n== {title}: {} Einträge, {}", list.len(), human(bytes));
+    for (label, n, b) in Triage::summary(list) {
+        println!("   {label}: {n} ({})", human(b));
+    }
+    for c in list {
+        let what = match &c.action.kind {
+            ActionKind::Quarantine => "Quarantäne".to_string(),
+            ActionKind::MoveTo(t) => format!("→ {}", t.display()),
+        };
+        println!(
+            "  {:>10}  {}  {}",
+            if c.action.is_dir {
+                "Ordner".into()
+            } else {
+                human(c.size())
+            },
+            result.relative(&c.action.source).display(),
+            what
+        );
+        println!("              {}", c.reason);
+        for h in &c.hints {
+            println!("              {h}");
+        }
+    }
+}
+
+fn print_profiles(p: &OrganizePlan, result: &ScanResult) {
+    if p.profiles.is_empty() {
+        return;
+    }
+    println!("\n== Unterordner");
+    for f in &p.profiles {
+        let verdict = match &f.verdict {
+            FolderVerdict::Keep(why) if why.is_empty() => "bleibt".to_string(),
+            FolderVerdict::Keep(why) => format!("bleibt ({why})"),
+            FolderVerdict::MoveWhole(c) => format!("wird als Ganzes nach {} verschoben", c.label()),
+            FolderVerdict::Distribute => "gemischt, Verteilung vorgeschlagen (unsicher)".into(),
+            FolderVerdict::Unsure(why) => format!("unsicher ({why})"),
+        };
+        println!(
+            "  {:<32} {:>6} Dateien {:>10}  {}",
+            result.relative(&result.dirs[f.dir].path).display(),
+            f.files,
+            human(f.bytes),
+            verdict
+        );
+        if !f.composition.is_empty() {
+            println!("  {:<32} {}", "", f.composition);
+        }
+    }
+}
+
+fn print_after(after: &AfterTree) {
+    println!("\n== Struktur danach (nur sichere Aktionen)");
+    for f in &after.folders {
+        let name = if f.rel.is_empty() {
+            "(lose im Ordner)"
+        } else {
+            f.rel.as_str()
+        };
+        println!(
+            "  {:<32} {:>6} Dateien {:>10}  (+{} eingehend)",
+            name,
+            f.files(),
+            human(f.bytes()),
+            f.incoming.len()
+        );
+        for inc in f.incoming.iter().take(8) {
+            println!(
+                "      + {}  ← {}",
+                inc.name,
+                inc.from.as_deref().unwrap_or("?")
+            );
+        }
+        if f.incoming.len() > 8 {
+            println!("      … und {} weitere", f.incoming.len() - 8);
+        }
+    }
+}
+
+fn finish_auto(plan: &Plan, apply: bool) -> anyhow::Result<()> {
+    if plan.is_empty() {
+        println!("\nNichts zu tun.");
+        return Ok(());
+    }
+    if !apply {
+        println!(
+            "\nVorschau: {} Einträge, {}. Mit --apply wird verschoben.",
+            plan.len(),
+            human(plan.total_bytes())
+        );
+        return Ok(());
+    }
+    let report = actions::execute(plan, false)?;
+    println!(
+        "\n{} Einträge verschoben ({}), {} übersprungen.",
+        report.moved,
+        human(report.bytes),
+        report.failed.len()
+    );
+    for (p, e) in &report.failed {
+        println!("    ÜBERSPRUNGEN {}: {e}", p.display());
+    }
+    if let Some(j) = report.journal_path {
+        println!("Rückgängig mit: tidyscan undo \"{}\"", j.display());
+    }
+    Ok(())
 }

@@ -22,7 +22,7 @@ use globset::{Glob, GlobMatcher};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::actions::{Action, ActionKind, Plan};
+use crate::actions::{Action, ActionKind, Guard, Plan};
 use crate::analysis::Category;
 use crate::model::{FileEntry, ScanResult};
 
@@ -233,6 +233,7 @@ pub fn apply_rules(result: &ScanResult, rules: &[CompiledRule], now: SystemTime)
             size: file.size,
             kind,
             reason: rule.rule.name.clone(),
+            guard: Some(Guard::for_file(file)),
         });
     }
     plan

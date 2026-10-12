@@ -278,31 +278,6 @@ fn confirm_modal(app: &mut App, ctx: &egui::Context) {
     }
     if run {
         app.confirm_execute = false;
-        execute(app, plan);
+        app.execute_plan(plan);
     }
-}
-
-fn execute(app: &mut App, plan: actions::Plan) {
-    let msg = match actions::execute(&plan, false) {
-        Ok(rep) => {
-            let mut m = format!(
-                "{} Einträge verschoben ({}), {} fehlgeschlagen.",
-                rep.moved,
-                human(rep.bytes),
-                rep.failed.len()
-            );
-            for (p, e) in rep.failed.iter().take(10) {
-                m.push_str(&format!("\n  {}: {e}", p.display()));
-            }
-            if let Some(j) = rep.journal_path {
-                m.push_str(&format!("\nJournal: {}", j.display()));
-            }
-            m
-        }
-        Err(e) => format!("Ausführen fehlgeschlagen: {e:#}"),
-    };
-    app.selection.clear();
-    app.start_scan();
-    app.last_report = Some(msg);
-    app.journals = actions::list_journals(&app.root());
 }

@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,63 @@ pub enum ActionKind {
     MoveTo(PathBuf),
 }
 
+/// Expectations checked right before a move. Anything that no longer holds means
+/// the world changed since the scan, and the action is skipped instead of executed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Guard {
+    pub size: u64,
+    pub modified: Option<SystemTime>,
+    /// For duplicates: the copy that stays behind must still exist with the same size.
+    pub keep: Option<PathBuf>,
+}
+
+impl Guard {
+    pub fn for_file(file: &crate::model::FileEntry) -> Self {
+        Self {
+            size: file.size,
+            modified: file.modified,
+            keep: None,
+        }
+    }
+
+    pub fn with_keep(mut self, keep: PathBuf) -> Self {
+        self.keep = Some(keep);
+        self
+    }
+
+    /// `Err(reason)` when the guard no longer holds.
+    pub fn check(&self, source: &Path) -> Result<(), String> {
+        let md = fs::metadata(source).map_err(|e| format!("nicht mehr lesbar: {e}"))?;
+        if md.is_file() {
+            if md.len() != self.size {
+                return Err("seit dem Scan verändert (Größe)".into());
+            }
+            if let (Some(expected), Ok(actual)) = (self.modified, md.modified())
+                && !same_instant(expected, actual)
+            {
+                return Err("seit dem Scan verändert (Datum)".into());
+            }
+        }
+        if let Some(keep) = &self.keep {
+            match fs::metadata(keep) {
+                Ok(k) if k.len() == self.size => {}
+                Ok(_) => return Err("Original-Kopie hat jetzt eine andere Größe".into()),
+                Err(_) => return Err("Original-Kopie fehlt".into()),
+            }
+        }
+        Ok(())
+    }
+}
+
+fn same_instant(a: SystemTime, b: SystemTime) -> bool {
+    // Filesystems round timestamps differently; a two-second window covers FAT.
+    let d = a
+        .duration_since(b)
+        .or_else(|_| b.duration_since(a))
+        .unwrap_or_default();
+    d <= std::time::Duration::from_secs(2)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Action {
     pub source: PathBuf,
@@ -33,6 +91,8 @@ pub struct Action {
     pub size: u64,
     pub kind: ActionKind,
     pub reason: String,
+    #[serde(default)]
+    pub guard: Option<Guard>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +296,12 @@ pub fn execute(plan: &Plan, dry_run: bool) -> anyhow::Result<ExecReport> {
                 action.source.clone(),
                 "liegt bereits in der Quarantäne".into(),
             ));
+            continue;
+        }
+        if let Some(g) = &action.guard
+            && let Err(reason) = g.check(&action.source)
+        {
+            report.failed.push((action.source.clone(), reason));
             continue;
         }
         let dest = unique_destination(plan.destination(action, &session));

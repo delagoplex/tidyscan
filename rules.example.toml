@@ -1,0 +1,29 @@
+# Beispielregeln für tidyscan. Die erste passende Regel gewinnt.
+# Größen: 500, 10K, 1.5M, 2G. Platzhalter in move_to: {year} {month} {ext} {name}.
+
+[[rule]]
+name = "Alte Installer in Quarantäne"
+ext = ["exe", "msi", "msix", "dmg", "pkg", "deb", "rpm", "appimage"]
+older_than_days = 90
+action = "quarantine"
+
+[[rule]]
+name = "Alte Archive in Quarantäne"
+category = "archive"
+older_than_days = 365
+min_size = "10M"
+action = "quarantine"
+
+[[rule]]
+name = "Screenshots nach Jahr archivieren"
+glob = "**/Screenshot*"
+older_than_days = 30
+action = "move"
+move_to = "Archiv/Screenshots/{year}"
+
+[[rule]]
+name = "Alte Downloads sortieren"
+glob = "Downloads/**"
+older_than_days = 180
+action = "move"
+move_to = "Archiv/Downloads/{year}-{month}"

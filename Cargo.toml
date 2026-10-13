@@ -36,3 +36,7 @@ toml = "1.1.8"
 [dev-dependencies]
 filetime = "0.2.29"
 tempfile = "3.27.0"
+
+# Keine Debug-Infos für fremde Crates: halbiert target/debug, Backtraces im eigenen Code bleiben.
+[profile.dev.package."*"]
+debug = false

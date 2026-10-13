@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crossbeam_channel::{Receiver, unbounded};
 use eframe::egui::{self, Ui};
 
-use super::{App, Tab};
+use super::{App, Tab, theme};
 use crate::actions::{ActionKind, Plan};
 use crate::analysis::human;
 use crate::context::{self, DirContext};
@@ -273,18 +273,16 @@ pub fn show(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
     let busy = app.auto.busy();
 
     ui.horizontal_wrapped(|ui| {
-        if ui
-            .add_enabled(!busy, egui::Button::new("Quarantäne-Vorschlag berechnen"))
-            .clicked()
-        {
-            start(app, Mode::Quarantine);
-        }
-        if ui
-            .add_enabled(!busy, egui::Button::new("Sortier-Vorschlag berechnen"))
-            .clicked()
-        {
-            start(app, Mode::Organize);
-        }
+        ui.add_enabled_ui(!busy, |ui| {
+            if theme::primary_button(ui, "Quarantäne-Vorschlag berechnen").clicked() {
+                start(app, Mode::Quarantine);
+            }
+        });
+        ui.add_enabled_ui(!busy, |ui| {
+            if theme::primary_button(ui, "Sortier-Vorschlag berechnen").clicked() {
+                start(app, Mode::Organize);
+            }
+        });
         ui.separator();
         ui.checkbox(&mut app.auto.include_dupes, "Duplikate einbeziehen");
         ui.checkbox(&mut app.auto.by_year, "Jahres-Unterordner beim Sortieren");
@@ -330,12 +328,18 @@ pub fn show(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
         .map(|i| i.cand.size())
         .sum();
     ui.horizontal(|ui| {
-        ui.strong(mode.title());
-        ui.label(format!(
-            "{safe_n} sicher ({}) · {unsure_n} unsicher · {} geschützt übersprungen",
-            human(safe_b),
-            app.auto.protected
-        ));
+        ui.label(egui::RichText::new(mode.title()).size(17.0).strong());
+        theme::pill(
+            ui,
+            &format!("{safe_n} sicher · {}", human(safe_b)),
+            theme::GREEN,
+        );
+        theme::pill(ui, &format!("{unsure_n} unsicher"), theme::AMBER);
+        theme::pill(
+            ui,
+            &format!("{} geschützt", app.auto.protected),
+            theme::TEXT_DIM,
+        );
     });
 
     // Bottom action bar first so it stays visible.
@@ -574,7 +578,7 @@ fn group_indices(app: &AutoState, safe: bool) -> Vec<(&'static str, Vec<usize>)>
 }
 
 fn safe_section(app: &mut App, result: &ScanResult, ui: &mut Ui) {
-    ui.heading("Sicher");
+    theme::section_heading(ui, "Sicher", theme::GREEN);
     let groups = group_indices(&app.auto, true);
     if groups.is_empty() {
         ui.label("Nichts, was sich gefahrlos automatisch erledigen lässt.");
@@ -618,7 +622,7 @@ fn safe_section(app: &mut App, result: &ScanResult, ui: &mut Ui) {
 }
 
 fn unsure_section(app: &mut App, result: &ScanResult, ui: &mut Ui, busy: bool) {
-    ui.heading("Unsicher");
+    theme::section_heading(ui, "Unsicher", theme::AMBER);
     let groups = group_indices(&app.auto, false);
     if groups.is_empty() {
         ui.label("Keine unsicheren Einträge.");

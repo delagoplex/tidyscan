@@ -5,6 +5,7 @@ mod cleanup;
 mod lists;
 mod overview;
 mod quarantine;
+pub(crate) mod theme;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -166,7 +167,8 @@ pub struct App {
 }
 
 impl App {
-    fn new(_cc: &eframe::CreationContext<'_>, preset: Option<PathBuf>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, preset: Option<PathBuf>) -> Self {
+        theme::apply(&cc.egui_ctx);
         let auto_scan = preset.is_some();
         let auto_after_scan = match std::env::var("TIDYSCAN_AUTO").as_deref() {
             Ok("quarantine") => Some(auto::Mode::Quarantine),
@@ -435,70 +437,102 @@ impl App {
     }
 
     fn left_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("tidyscan");
-        ui.add_space(8.0);
-        ui.label("Ordner");
-        ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.root_text).desired_width(f32::INFINITY));
-        });
-        if ui.button("Ordner wählen …").clicked() {
-            self.pick_folder();
-        }
         ui.add_space(6.0);
-        ui.checkbox(&mut self.skip_hidden, "Versteckte überspringen");
-        ui.label("Ausschlüsse (Glob, eine je Zeile)");
-        ui.add(
-            egui::TextEdit::multiline(&mut self.exclude_text)
-                .desired_rows(3)
-                .desired_width(f32::INFINITY)
-                .font(egui::TextStyle::Monospace),
-        );
-        ui.add_space(8.0);
-        if self.scanning() {
-            if ui.button("Abbrechen").clicked() {
-                self.cancel_scan();
-            }
-            if let Some(j) = &self.scan_job {
-                ui.add(egui::Spinner::new());
-                ui.label(format!(
-                    "{} Dateien, {} Ordner, {}",
-                    j.last.files,
-                    j.last.dirs,
-                    human(j.last.bytes)
-                ));
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(j.last.current.to_string_lossy())
-                            .small()
-                            .weak(),
-                    )
-                    .truncate(),
-                );
-            }
-        } else if ui
-            .add_sized([ui.available_width(), 28.0], egui::Button::new("Scannen"))
-            .clicked()
-        {
-            self.start_scan();
-        }
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("tidyscan")
+                    .size(24.0)
+                    .strong()
+                    .color(theme::TEXT),
+            );
+            ui.label(
+                egui::RichText::new(env!("CARGO_PKG_VERSION"))
+                    .small()
+                    .color(theme::TEXT_DIM),
+            );
+        });
+        ui.add_space(10.0);
 
-        ui.add_space(12.0);
-        ui.separator();
-        ui.label(egui::RichText::new(&self.status).small());
-        if let Some(e) = &self.error {
-            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), e);
-        }
-        if !self.selection.is_empty() {
-            ui.add_space(8.0);
-            ui.label(format!(
-                "Im Plan: {} Einträge, {}",
-                self.selection.len(),
-                human(self.selection.total_bytes())
-            ));
-            if ui.button("Zum Aufräumen-Tab").clicked() {
-                self.tab = Tab::Cleanup;
+        theme::card(ui, |ui| {
+            theme::caption(ui, "Ordner");
+            ui.add(egui::TextEdit::singleline(&mut self.root_text).desired_width(f32::INFINITY));
+            if ui.button("Ordner wählen …").clicked() {
+                self.pick_folder();
             }
-        }
+            ui.add_space(10.0);
+            theme::caption(ui, "Optionen");
+            ui.checkbox(&mut self.skip_hidden, "Versteckte überspringen");
+            ui.label(
+                egui::RichText::new("Ausschlüsse (Glob, eine je Zeile)")
+                    .small()
+                    .color(theme::TEXT_DIM),
+            );
+            ui.add(
+                egui::TextEdit::multiline(&mut self.exclude_text)
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace),
+            );
+            ui.add_space(12.0);
+            if self.scanning() {
+                if ui
+                    .add_sized([ui.available_width(), 32.0], egui::Button::new("Abbrechen"))
+                    .clicked()
+                {
+                    self.cancel_scan();
+                }
+                if let Some(j) = &self.scan_job {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().color(theme::ACCENT));
+                        ui.label(format!(
+                            "{} Dateien, {} Ordner, {}",
+                            j.last.files,
+                            j.last.dirs,
+                            human(j.last.bytes)
+                        ));
+                    });
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(j.last.current.to_string_lossy())
+                                .small()
+                                .color(theme::TEXT_DIM),
+                        )
+                        .truncate(),
+                    );
+                }
+            } else if theme::primary_button_wide(ui, "Scannen").clicked() {
+                self.start_scan();
+            }
+        });
+
+        ui.add_space(10.0);
+        theme::card(ui, |ui| {
+            theme::caption(ui, "Status");
+            ui.label(
+                egui::RichText::new(&self.status)
+                    .small()
+                    .color(theme::TEXT_DIM),
+            );
+            if let Some(e) = &self.error {
+                ui.colored_label(theme::RED, e);
+            }
+            if !self.selection.is_empty() {
+                ui.add_space(6.0);
+                theme::pill(
+                    ui,
+                    &format!(
+                        "Im Plan: {} Einträge, {}",
+                        self.selection.len(),
+                        human(self.selection.total_bytes())
+                    ),
+                    theme::ACCENT,
+                );
+                if ui.button("Zum Aufräumen-Tab").clicked() {
+                    self.tab = Tab::Cleanup;
+                }
+            }
+        });
     }
 }
 
@@ -520,22 +554,35 @@ impl eframe::App for App {
             .default_size(260.0)
             .show(ui, |ui| self.left_panel(ui));
 
-        egui::Panel::top("tabs").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Overview, "Übersicht");
-                ui.selectable_value(&mut self.tab, Tab::Old, "Alte Dateien");
-                ui.selectable_value(&mut self.tab, Tab::Dupes, "Duplikate");
-                ui.selectable_value(&mut self.tab, Tab::Empty, "Leere Ordner");
-                ui.selectable_value(&mut self.tab, Tab::Auto, "Automatik");
-                let label = if self.selection.is_empty() {
-                    "Aufräumen".to_string()
-                } else {
-                    format!("Aufräumen ({})", self.selection.len())
-                };
-                ui.selectable_value(&mut self.tab, Tab::Cleanup, label);
-                ui.selectable_value(&mut self.tab, Tab::Quarantine, "Quarantäne");
+        egui::Panel::top("tabs")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::SURFACE)
+                    .inner_margin(egui::Margin::symmetric(6, 0)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let plan_label = if self.selection.is_empty() {
+                        "Aufräumen".to_string()
+                    } else {
+                        format!("Aufräumen ({})", self.selection.len())
+                    };
+                    let tabs = [
+                        (Tab::Overview, "Übersicht".to_string()),
+                        (Tab::Old, "Alte Dateien".to_string()),
+                        (Tab::Dupes, "Duplikate".to_string()),
+                        (Tab::Empty, "Leere Ordner".to_string()),
+                        (Tab::Auto, "Automatik".to_string()),
+                        (Tab::Cleanup, plan_label),
+                        (Tab::Quarantine, "Quarantäne".to_string()),
+                    ];
+                    for (t, label) in tabs {
+                        if theme::tab(ui, self.tab == t, &label).clicked() {
+                            self.tab = t;
+                        }
+                    }
+                });
             });
-        });
 
         egui::CentralPanel::default().show(ui, |ui| {
             if self.result.is_none() && !matches!(self.tab, Tab::Cleanup | Tab::Quarantine) {

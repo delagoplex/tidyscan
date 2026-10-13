@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Ui};
 
-use super::{App, reveal};
+use super::{App, reveal, theme};
 use crate::actions::{self, JournalEntry, SessionInfo};
 use crate::analysis::human;
 
@@ -143,13 +143,7 @@ pub fn show(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                         if s.entries > 0 && ui.button("Alles wiederherstellen").clicked() {
                             restore_session = Some(s.journal_path.clone());
                         }
-                        if ui
-                            .button(
-                                egui::RichText::new("Endgültig löschen …")
-                                    .color(egui::Color32::from_rgb(230, 110, 100)),
-                            )
-                            .clicked()
-                        {
+                        if theme::danger_button(ui, "Endgültig löschen …").clicked() {
                             app.quarantine.confirm = Some(Purge::Session(s.journal_path.clone()));
                         }
                     }
@@ -181,13 +175,7 @@ pub fn show(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                             if ui.small_button("Wiederherstellen").clicked() {
                                 restore_entry = Some((s.journal_path.clone(), i));
                             }
-                            if ui
-                                .small_button(
-                                    egui::RichText::new("Löschen")
-                                        .color(egui::Color32::from_rgb(230, 110, 100)),
-                                )
-                                .clicked()
-                            {
+                            if theme::danger_button(ui, "Löschen").clicked() {
                                 app.quarantine.confirm =
                                     Some(Purge::Entry(s.journal_path.clone(), i));
                             }

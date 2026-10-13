@@ -6,7 +6,7 @@ use std::time::SystemTime;
 use eframe::egui::{self, Ui};
 use egui_extras::{Column, TableBuilder};
 
-use super::App;
+use super::{App, theme};
 use crate::actions::ActionKind;
 use crate::analysis::human;
 use crate::rules;
@@ -30,7 +30,7 @@ pub fn show(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
 }
 
 fn plan_section(app: &mut App, ui: &mut Ui) {
-    ui.heading("Plan");
+    theme::section_heading(ui, "Plan", theme::ACCENT);
     ui.weak(
         "Nichts wird gelöscht. Einträge wandern in <Ordner>/.tidyscan-quarantine/<Zeitstempel>/ \
          (oder in das Regel-Ziel) und können jederzeit zurückgeholt werden.",
@@ -126,7 +126,7 @@ fn plan_section(app: &mut App, ui: &mut Ui) {
 }
 
 fn rules_section(app: &mut App, ui: &mut Ui) {
-    ui.heading("Regeln");
+    theme::section_heading(ui, "Regeln", theme::ACCENT);
     ui.weak("TOML-Regeldatei: Treffer werden dem Plan hinzugefügt. Erste passende Regel gewinnt.");
     ui.horizontal(|ui| {
         ui.add(

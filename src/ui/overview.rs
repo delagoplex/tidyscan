@@ -2,7 +2,7 @@
 
 use eframe::egui::{self, Ui};
 
-use super::{App, dir_action, file_action, reveal};
+use super::{App, dir_action, file_action, reveal, theme};
 use crate::analysis::{self, AgeBucket, Category, human};
 use crate::model::{DirId, FileId, ScanResult};
 
@@ -87,6 +87,16 @@ fn tree_node(
                 ));
             }
         });
+    {
+        // Faint bar behind the header, proportional to the folder's share of the root.
+        let r = resp.header_response.rect;
+        let w = r.width() * (d.total_size as f32 / root_size as f32);
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(r.min, egui::vec2(w, r.height())),
+            egui::CornerRadius::same(4),
+            theme::ACCENT.gamma_multiply(0.10),
+        );
+    }
     if resp.header_response.clicked() {
         *selected = id;
     }
@@ -130,12 +140,12 @@ fn details(app: &mut App, result: &ScanResult, ui: &mut Ui) {
                 }
             });
             ui.label(egui::RichText::new(d.path.to_string_lossy()).weak().small());
-            ui.label(format!(
-                "{}   {} Dateien   {} Unterordner",
-                human(d.total_size),
-                d.total_files,
-                d.total_dirs
-            ));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                theme::stat_tile(ui, "Größe", &human(d.total_size));
+                theme::stat_tile(ui, "Dateien", &d.total_files.to_string());
+                theme::stat_tile(ui, "Unterordner", &d.total_dirs.to_string());
+            });
             if !result.errors.is_empty() && id == 0 {
                 ui.colored_label(
                     egui::Color32::from_rgb(220, 160, 60),
@@ -146,8 +156,8 @@ fn details(app: &mut App, result: &ScanResult, ui: &mut Ui) {
                 );
             }
 
-            ui.add_space(10.0);
-            ui.strong("Nach Kategorie");
+            ui.add_space(14.0);
+            theme::caption(ui, "Nach Kategorie");
             let sizes = &app.cat_sizes[id];
             let mut cats: Vec<(Category, u64)> = Category::ALL
                 .iter()
@@ -156,23 +166,29 @@ fn details(app: &mut App, result: &ScanResult, ui: &mut Ui) {
             cats.sort_by_key(|a| std::cmp::Reverse(a.1));
             let total = d.total_size.max(1) as f32;
             egui::Grid::new("cats")
-                .num_columns(3)
-                .spacing([12.0, 4.0])
+                .num_columns(4)
+                .spacing([12.0, 6.0])
                 .show(ui, |ui| {
                     for (c, b) in cats.into_iter().filter(|(_, b)| *b > 0) {
-                        ui.label(c.label());
-                        ui.add(
-                            egui::ProgressBar::new(b as f32 / total)
-                                .desired_width(220.0)
-                                .text(format!("{:.1} %", b as f32 * 100.0 / total)),
+                        ui.horizontal(|ui| {
+                            let (dot, _) = ui
+                                .allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                            ui.painter()
+                                .circle_filled(dot.center(), 5.0, theme::category_color(c));
+                            ui.label(c.label());
+                        });
+                        theme::bar(ui, b as f32 / total, theme::category_color(c), 220.0, 10.0);
+                        ui.label(
+                            egui::RichText::new(format!("{:.1} %", b as f32 * 100.0 / total))
+                                .color(theme::TEXT_DIM),
                         );
                         ui.label(human(b));
                         ui.end_row();
                     }
                 });
 
-            ui.add_space(10.0);
-            ui.strong("Nach Alter (Änderungsdatum)");
+            ui.add_space(14.0);
+            theme::caption(ui, "Nach Alter (Änderungsdatum)");
             let ages = app
                 .detail_cache
                 .as_ref()
@@ -184,15 +200,15 @@ fn details(app: &mut App, result: &ScanResult, ui: &mut Ui) {
                 .show(ui, |ui| {
                     for b in ages {
                         ui.label(b.label);
-                        ui.add(egui::ProgressBar::new(b.bytes as f32 / total).desired_width(220.0));
+                        theme::bar(ui, b.bytes as f32 / total, theme::ACCENT, 220.0, 10.0);
                         ui.label(human(b.bytes));
                         ui.label(format!("{} Dateien", b.files));
                         ui.end_row();
                     }
                 });
 
-            ui.add_space(10.0);
-            ui.strong("Größte Dateien");
+            ui.add_space(14.0);
+            theme::caption(ui, "Größte Dateien");
             let largest = app
                 .detail_cache
                 .as_ref()

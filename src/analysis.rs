@@ -201,6 +201,28 @@ pub fn extension_stats(result: &ScanResult) -> Vec<(String, u64, u64)> {
     v
 }
 
+/// Thousands separator in German style: 1.234.567.
+pub fn fmt_count(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push('.');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Date as dd.mm.yyyy in local time.
+pub fn fmt_date(t: SystemTime) -> String {
+    let dt = time::OffsetDateTime::from(t);
+    let dt = time::UtcOffset::current_local_offset()
+        .map(|o| dt.to_offset(o))
+        .unwrap_or(dt);
+    format!("{:02}.{:02}.{}", dt.day(), dt.month() as u8, dt.year())
+}
+
 pub fn human(bytes: u64) -> String {
     humansize::format_size(bytes, humansize::BINARY)
 }

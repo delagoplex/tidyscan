@@ -57,6 +57,9 @@ pub struct DirNode {
     pub total_files: u64,
     /// Recursive directory count (not including self).
     pub total_dirs: u64,
+    /// Newest modification time of any file below this directory.
+    #[serde(default)]
+    pub newest: Option<SystemTime>,
 }
 
 impl DirNode {
@@ -114,22 +117,29 @@ impl ScanResult {
             d.total_size = 0;
             d.total_files = 0;
             d.total_dirs = 0;
+            d.newest = None;
         }
         for f in &self.files {
             let d = &mut self.dirs[f.parent];
             d.total_size += f.size;
             d.total_files += 1;
+            if f.modified > d.newest {
+                d.newest = f.modified;
+            }
         }
         for i in (1..self.dirs.len()).rev() {
-            let (size, files, dirs) = {
+            let (size, files, dirs, newest) = {
                 let d = &self.dirs[i];
-                (d.total_size, d.total_files, d.total_dirs)
+                (d.total_size, d.total_files, d.total_dirs, d.newest)
             };
             if let Some(p) = self.dirs[i].parent {
                 let parent = &mut self.dirs[p];
                 parent.total_size += size;
                 parent.total_files += files;
                 parent.total_dirs += dirs + 1;
+                if newest > parent.newest {
+                    parent.newest = newest;
+                }
             }
         }
     }

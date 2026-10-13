@@ -2,11 +2,10 @@
 
 use eframe::egui::{self, Ui};
 
-use super::{App, dir_action, file_action, reveal, theme};
+use super::{App, dir_action, file_action, reveal, theme, tree, treemap};
 use crate::analysis::{self, AgeBucket, Category, human};
 use crate::model::{DirId, FileId, ScanResult};
 
-const MAX_CHILDREN_SHOWN: usize = 400;
 const TOP_FILES: usize = 25;
 
 pub(crate) struct DetailCache {
@@ -19,87 +18,26 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     let Some(result) = app.result.clone() else {
         return;
     };
-    let root_size = result.total_size().max(1);
 
-    egui::Panel::left("tree_panel")
+    if app.show_details {
+        egui::Panel::right("details_panel")
+            .resizable(true)
+            .default_size(360.0)
+            .show(ui, |ui| {
+                details(app, &result, ui);
+            });
+    }
+
+    egui::Panel::bottom("treemap_panel")
         .resizable(true)
-        .default_size(ui.available_width() * 0.45)
+        .default_size(300.0)
         .show(ui, |ui| {
-            egui::ScrollArea::both()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    tree_node(ui, &result, 0, root_size, &mut app.selected_dir, 0);
-                });
+            treemap::show(app, &result, ui);
         });
 
     egui::CentralPanel::default().show(ui, |ui| {
-        details(app, &result, ui);
+        tree::show(app, &result, ui);
     });
-}
-
-fn tree_node(
-    ui: &mut Ui,
-    result: &ScanResult,
-    id: DirId,
-    root_size: u64,
-    selected: &mut DirId,
-    depth: usize,
-) {
-    let d = &result.dirs[id];
-    let pct = d.total_size as f64 * 100.0 / root_size as f64;
-    let label = format!(
-        "{}   {}   {:.1} %   {} Dateien",
-        d.name(),
-        human(d.total_size),
-        pct,
-        d.total_files
-    );
-    let text = if *selected == id {
-        egui::RichText::new(label).strong()
-    } else {
-        egui::RichText::new(label)
-    };
-
-    if d.children.is_empty() {
-        ui.horizontal(|ui| {
-            ui.add_space(18.0);
-            if ui.selectable_label(*selected == id, text).clicked() {
-                *selected = id;
-            }
-        });
-        return;
-    }
-
-    let mut children: Vec<DirId> = d.children.clone();
-    children.sort_by(|a, b| result.dirs[*b].total_size.cmp(&result.dirs[*a].total_size));
-
-    let resp = egui::CollapsingHeader::new(text)
-        .id_salt(id)
-        .default_open(depth == 0)
-        .show(ui, |ui| {
-            for &c in children.iter().take(MAX_CHILDREN_SHOWN) {
-                tree_node(ui, result, c, root_size, selected, depth + 1);
-            }
-            if children.len() > MAX_CHILDREN_SHOWN {
-                ui.weak(format!(
-                    "… {} weitere Unterordner (zu viele zum Anzeigen)",
-                    children.len() - MAX_CHILDREN_SHOWN
-                ));
-            }
-        });
-    {
-        // Faint bar behind the header, proportional to the folder's share of the root.
-        let r = resp.header_response.rect;
-        let w = r.width() * (d.total_size as f32 / root_size as f32);
-        ui.painter().rect_filled(
-            egui::Rect::from_min_size(r.min, egui::vec2(w, r.height())),
-            egui::CornerRadius::same(4),
-            theme::ACCENT.gamma_multiply(0.10),
-        );
-    }
-    if resp.header_response.clicked() {
-        *selected = id;
-    }
 }
 
 fn details(app: &mut App, result: &ScanResult, ui: &mut Ui) {

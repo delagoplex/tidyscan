@@ -6,7 +6,7 @@ Ordner analysieren und sicher aufräumen. Ein Binary für Windows, macOS und Lin
 
 ## Funktionen
 
-- **Strukturanalyse**: Ordnerbaum mit Größen, Dateianzahl, Anteil am Gesamtvolumen, Aufteilung nach Kategorie (Bilder, Videos, Dokumente, Installer, …), Altersverteilung und größte Dateien.
+- **Strukturanalyse**: Baumtabelle wie in TreeSize mit sortierbaren Spalten (Größe, Anteil-Balken, Dateien, Ordner, letzte Änderung), darunter eine Treemap mit Zoom (Doppelklick) und wählbarer Verschachtelungstiefe, daneben Details zum gewählten Ordner: Kategorien, Altersverteilung, größte Dateien.
 - **Alte Dateien**: alles, was seit N Tagen unverändert ist. Zugriffszeiten werden auf Zuverlässigkeit geprüft, weil Windows NTFS und Linux `relatime` sie meist nicht aktualisieren.
 - **Duplikate**: byte-identische Dateien über Größe, Präfix-Hash und vollständigen BLAKE3-Hash, parallel auf allen Kernen.
 - **Leere Ordner und 0-Byte-Dateien**, rekursiv erkannt.

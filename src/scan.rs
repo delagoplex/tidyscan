@@ -202,6 +202,7 @@ pub fn scan(
                 total_size: 0,
                 total_files: 0,
                 total_dirs: 0,
+                newest: None,
             });
             if let Some(p) = parent {
                 result.dirs[p].children.push(id);

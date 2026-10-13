@@ -6,6 +6,8 @@ mod lists;
 mod overview;
 mod quarantine;
 pub(crate) mod theme;
+mod tree;
+mod treemap;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -134,6 +136,9 @@ pub struct App {
     // Overview
     pub(crate) selected_dir: DirId,
     pub(crate) detail_cache: Option<overview::DetailCache>,
+    pub(crate) tree: tree::TreeState,
+    pub(crate) treemap: treemap::TreemapState,
+    pub(crate) show_details: bool,
 
     // Old files
     pub(crate) old_days: u64,
@@ -200,6 +205,9 @@ impl App {
             auto_after_scan,
             selected_dir: 0,
             detail_cache: None,
+            tree: tree::TreeState::default(),
+            treemap: treemap::TreemapState::default(),
+            show_details: true,
             old_days: 365,
             old_basis: AgeBasis::Modified,
             atime: None,
@@ -317,6 +325,8 @@ impl App {
                     self.quarantine.stale = true;
                     self.selected_dir = 0;
                     self.detail_cache = None;
+                    self.tree.reset();
+                    self.treemap.reset();
                     self.old_dirty = true;
                     self.old_filter_applied = None;
                     self.result = Some(Arc::new(r));
@@ -626,7 +636,7 @@ pub fn run(preset: Option<PathBuf>) -> anyhow::Result<()> {
     detach_console();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1240.0, 820.0])
+            .with_inner_size([1500.0, 900.0])
             .with_min_inner_size([800.0, 500.0])
             .with_title("tidyscan"),
         ..Default::default()

@@ -6,8 +6,8 @@ use std::time::SystemTime;
 use eframe::egui::{self, Ui};
 use egui_extras::{Column, TableBuilder};
 
-use super::{App, reveal};
-use crate::actions::{self, ActionKind};
+use super::App;
+use crate::actions::ActionKind;
 use crate::analysis::human;
 use crate::rules;
 
@@ -20,8 +20,6 @@ pub fn show(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
             plan_section(app, ui);
             ui.separator();
             rules_section(app, ui);
-            ui.separator();
-            undo_section(app, ui);
             if let Some(rep) = &app.last_report {
                 ui.separator();
                 ui.strong("Letzter Lauf");
@@ -99,7 +97,7 @@ fn plan_section(app: &mut App, ui: &mut Ui) {
                     ui.label(&a.reason);
                 });
                 row.col(|ui| {
-                    ui.label(if a.is_dir {
+                    ui.label(if a.is_dir && a.size == 0 {
                         "Ordner".into()
                     } else {
                         human(a.size)
@@ -185,65 +183,6 @@ fn apply_rules(app: &mut App) {
             );
         }
         Err(e) => app.rules_error = Some(format!("{e:#}")),
-    }
-}
-
-fn undo_section(app: &mut App, ui: &mut Ui) {
-    ui.horizontal(|ui| {
-        ui.heading("Rückgängig");
-        if ui.small_button("Liste aktualisieren").clicked() {
-            app.journals = actions::list_journals(&app.root());
-        }
-    });
-    if app.journals.is_empty() {
-        ui.label("Keine Quarantäne-Sitzungen für diesen Ordner.");
-        return;
-    }
-    let mut undo_path: Option<PathBuf> = None;
-    for j in app.journals.clone() {
-        let session = j.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-        let name = session
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let info = actions::Journal::load(&j).ok();
-        ui.horizontal(|ui| {
-            ui.monospace(&name);
-            match &info {
-                Some(jr) if jr.undone => {
-                    ui.weak("bereits zurückgenommen");
-                }
-                Some(jr) => {
-                    ui.label(format!("{} Einträge", jr.entries.len()));
-                    if ui.button("Wiederherstellen").clicked() {
-                        undo_path = Some(j.clone());
-                    }
-                }
-                None => {
-                    ui.weak("Journal nicht lesbar");
-                }
-            }
-            if ui.small_button("Anzeigen").clicked() {
-                reveal(&session);
-            }
-        });
-    }
-    if let Some(j) = undo_path {
-        match actions::undo(&j) {
-            Ok(rep) => {
-                let mut msg = format!("{} Einträge wiederhergestellt.", rep.restored);
-                if !rep.conflicts.is_empty() {
-                    msg.push_str(&format!(" {} Konflikte:", rep.conflicts.len()));
-                    for (p, e) in rep.conflicts.iter().take(10) {
-                        msg.push_str(&format!("\n  {}: {e}", p.display()));
-                    }
-                }
-                app.last_report = Some(msg);
-                app.start_scan();
-                app.journals = actions::list_journals(&app.root());
-            }
-            Err(e) => app.last_report = Some(format!("Rückgängig fehlgeschlagen: {e:#}")),
-        }
     }
 }
 

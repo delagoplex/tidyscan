@@ -170,6 +170,24 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Quarantäne-Sitzungen eines Ordners auflisten
+    Quarantine {
+        /// Scan-Root, dessen Quarantäne gezeigt wird
+        root: PathBuf,
+    },
+    /// Quarantäne endgültig löschen (die einzige löschende Operation)
+    Purge {
+        /// Pfad zum undo.json oder zum Sitzungsordner
+        journal: Option<PathBuf>,
+        /// Scan-Root; mit --all alle Sitzungen, sonst die älteste
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        all: bool,
+        /// Ohne diese Angabe wird nur angezeigt, was gelöscht würde
+        #[arg(long)]
+        yes: bool,
+    },
     /// Beispiel-Regeldatei ausgeben
     ExampleRules,
 }
@@ -420,6 +438,68 @@ pub fn run(cli: Cli) -> anyhow::Result<Option<Option<PathBuf>>> {
             print_after(&p.after);
             let plan = p.to_plan(&result.root, include_unsure);
             finish_auto(&plan, apply)?;
+        }
+        Some(Command::Quarantine { root }) => {
+            let sessions: Vec<_> = actions::list_journals(&root)
+                .iter()
+                .filter_map(|j| actions::session_info(j))
+                .collect();
+            if sessions.is_empty() {
+                println!("Keine Quarantäne-Sitzungen unter {}", root.display());
+            }
+            for s in &sessions {
+                println!(
+                    "{}  {:>4} Einträge  {:>6} Dateien  {:>10}  {}",
+                    s.name,
+                    s.entries,
+                    s.files,
+                    human(s.bytes),
+                    if s.undone { "wiederhergestellt" } else { "" }
+                );
+            }
+        }
+        Some(Command::Purge {
+            journal,
+            root,
+            all,
+            yes,
+        }) => {
+            let targets: Vec<PathBuf> = match (journal, root) {
+                (Some(j), _) if j.is_dir() => vec![j.join(actions::JOURNAL_FILE)],
+                (Some(j), _) => vec![j],
+                (None, Some(r)) => {
+                    let mut js = actions::list_journals(&r);
+                    if !all {
+                        js.truncate(1);
+                    }
+                    js
+                }
+                (None, None) => anyhow::bail!("Bitte Journal-Pfad oder --root angeben"),
+            };
+            for j in &targets {
+                let Some(s) = actions::session_info(j) else {
+                    continue;
+                };
+                if yes {
+                    let r = actions::purge_session(j)?;
+                    println!(
+                        "{} gelöscht: {} Dateien, {}",
+                        s.name,
+                        r.removed,
+                        human(r.bytes)
+                    );
+                } else {
+                    println!(
+                        "Würde löschen: {} ({} Dateien, {})",
+                        s.name,
+                        s.files,
+                        human(s.bytes)
+                    );
+                }
+            }
+            if !yes {
+                println!("Mit --yes wird endgültig gelöscht.");
+            }
         }
         Some(Command::ExampleRules) => print!("{}", rules::EXAMPLE_RULES),
     }

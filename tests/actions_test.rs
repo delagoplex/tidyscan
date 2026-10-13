@@ -239,3 +239,108 @@ fn guard_skips_changed_files_and_missing_keep_copy() {
     assert!(reasons.iter().any(|m| m.contains("verändert")));
     assert!(reasons.iter().any(|m| m.contains("Original-Kopie fehlt")));
 }
+
+#[test]
+fn whole_folder_quarantine_roundtrip() {
+    let fx = Fixture::new();
+    fx.file("Projekt alt/a.txt", b"A");
+    fx.file("Projekt alt/sub/b.bin", &[1u8; 300]);
+    fx.dir_("Projekt alt/sub/leer");
+    fx.file("keep.txt", b"K");
+    let before = snapshot(&fx.root());
+
+    let r = scan_simple(&fx.root(), &ScanOptions::default()).unwrap();
+    let d = r.dirs.iter().find(|d| d.name() == "Projekt alt").unwrap();
+    let mut plan = Plan::new(r.root.clone());
+    plan.push(quarantine_action(
+        d.path.clone(),
+        true,
+        d.total_size,
+        "Ganzer Ordner",
+    ));
+
+    let rep = actions::execute(&plan, false).unwrap();
+    assert_eq!(rep.moved, 1, "{:?}", rep.failed);
+    assert_eq!(rep.bytes, 301);
+    assert!(!d.path.exists());
+    let session = rep
+        .journal_path
+        .clone()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    assert_eq!(
+        fs::read(session.join("Projekt alt/sub/b.bin")).unwrap(),
+        vec![1u8; 300]
+    );
+    assert!(session.join("Projekt alt/sub/leer").is_dir());
+
+    let undo = actions::undo(&rep.journal_path.unwrap()).unwrap();
+    assert_eq!(undo.restored, 1);
+    let mut after = snapshot(&fx.root());
+    after.retain(|(p, _)| !p.starts_with(QUARANTINE_DIR_NAME));
+    assert_eq!(after, before);
+}
+
+#[test]
+fn root_and_quarantine_are_never_moved() {
+    let fx = Fixture::new();
+    fx.file("x.txt", b"x");
+    let r = scan_simple(&fx.root(), &ScanOptions::default()).unwrap();
+    let mut plan = Plan::new(r.root.clone());
+    plan.push(quarantine_action(r.root.clone(), true, 1, "root"));
+    let rep = actions::execute(&plan, false).unwrap();
+    assert_eq!(rep.moved, 0);
+    assert!(rep.failed[0].1.contains("Quarantäne"));
+    assert!(fx.root().join("x.txt").exists());
+}
+
+#[test]
+fn purge_entry_and_session_and_single_restore() {
+    let fx = Fixture::new();
+    let a = fx.file("a.txt", b"aaaa");
+    let b = fx.file("b.txt", b"bbbb");
+    let c = fx.file("c.txt", b"cccc");
+    let r = scan_simple(&fx.root(), &ScanOptions::default()).unwrap();
+    let mut plan = Plan::new(r.root.clone());
+    for p in [&a, &b, &c] {
+        plan.push(quarantine_action(p.clone(), false, 4, "t"));
+    }
+    let rep = actions::execute(&plan, false).unwrap();
+    let journal = rep.journal_path.unwrap();
+    let session = journal.parent().unwrap().to_path_buf();
+    assert_eq!(actions::session_info(&journal).unwrap().files, 3);
+
+    // Restore only b.
+    let idx_b = actions::Journal::load(&journal)
+        .unwrap()
+        .entries
+        .iter()
+        .position(|e| e.from == b)
+        .unwrap();
+    actions::undo_entry(&journal, idx_b).unwrap();
+    assert_eq!(fs::read(&b).unwrap(), b"bbbb");
+    assert!(!session.join("b.txt").exists());
+    assert_eq!(actions::Journal::load(&journal).unwrap().entries.len(), 2);
+
+    // Delete a for good.
+    let idx_a = actions::Journal::load(&journal)
+        .unwrap()
+        .entries
+        .iter()
+        .position(|e| e.from == a)
+        .unwrap();
+    let pr = actions::purge_entry(&journal, idx_a).unwrap();
+    assert_eq!((pr.removed, pr.bytes), (1, 4));
+    assert!(!session.join("a.txt").exists() && !a.exists());
+    let j = actions::Journal::load(&journal).unwrap();
+    assert_eq!((j.entries.len(), j.purged), (1, 1));
+
+    // Delete the rest of the session.
+    let pr = actions::purge_session(&journal).unwrap();
+    assert_eq!(pr.removed, 1, "c.txt");
+    assert!(!session.exists());
+    assert!(actions::list_journals(&fx.root()).is_empty());
+    assert!(!c.exists());
+}

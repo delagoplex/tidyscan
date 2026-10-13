@@ -89,7 +89,17 @@ Bedingungen: `ext`, `glob` (relativ zum Scan-Ordner, immer mit `/`), `category` 
 
 ## Quarantäne
 
-Verschobene Dateien liegen unter `<Scan-Ordner>/.tidyscan-quarantine/<Zeitstempel>/` mit ihrer ursprünglichen relativen Struktur. Daneben liegt `undo.json`. Ein Undo stellt alles wieder her und überschreibt dabei nie etwas, was inzwischen am Originalpfad liegt. Den Quarantäne-Ordner endgültig zu leeren, bleibt bewusst eine manuelle Entscheidung.
+Verschobene Dateien und Ordner liegen unter `<Scan-Ordner>/.tidyscan-quarantine/<Zeitstempel>/` mit ihrer ursprünglichen relativen Struktur. Daneben liegt `undo.json`. Ein Undo stellt alles wieder her und überschreibt dabei nie etwas, was inzwischen am Originalpfad liegt.
+
+Ganze Ordner samt Inhalt lassen sich in der Übersicht über "Ganzen Ordner in Quarantäne (Plan)" aufnehmen; sie werden als Einheit verschoben und als Einheit wiederhergestellt.
+
+Der Tab **Quarantäne** listet alle Sitzungen mit Größe, lässt einzelne Einträge oder ganze Sitzungen wiederherstellen und ist die einzige Stelle, an der tidyscan Daten **endgültig löscht**, immer nach Rückfrage und nur innerhalb des Quarantäne-Ordners. Auf der Kommandozeile:
+
+```bash
+tidyscan quarantine <pfad>                 # Sitzungen auflisten
+tidyscan purge --root <pfad> [--all]       # zeigt, was gelöscht würde
+tidyscan purge --root <pfad> --all --yes   # löscht endgültig
+```
 
 ## Grenzen und Hinweise
 

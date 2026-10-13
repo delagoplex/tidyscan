@@ -189,6 +189,9 @@ pub struct Journal {
     pub entries: Vec<JournalEntry>,
     #[serde(default)]
     pub undone: bool,
+    /// Entries that were deleted for good from this session.
+    #[serde(default)]
+    pub purged: usize,
 }
 
 impl Journal {
@@ -251,10 +254,57 @@ fn move_file(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-/// "Move" an empty directory: create the destination, remove the (empty) source.
-fn move_empty_dir(from: &Path, to: &Path) -> io::Result<()> {
+/// Move a directory with everything inside it. Same device: one rename. Across
+/// devices: recursive copy, then the source is removed only after every file arrived.
+fn move_dir(from: &Path, to: &Path) -> io::Result<()> {
+    if let Some(p) = to.parent() {
+        fs::create_dir_all(p)?;
+    }
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::CrossesDevices || e.raw_os_error() == Some(17) => {
+            copy_dir_recursive(from, to)?;
+            fs::remove_dir_all(from)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn copy_dir_recursive(from: &Path, to: &Path) -> io::Result<()> {
     fs::create_dir_all(to)?;
-    fs::remove_dir(from)
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            copy_dir_recursive(&src, &dst)?;
+        } else if ft.is_file() {
+            fs::copy(&src, &dst)?;
+        }
+        // Symlinks are skipped: the scan never follows them and they carry no data.
+    }
+    Ok(())
+}
+
+/// Files and bytes below a directory, for quarantine statistics. The journal itself is not counted.
+pub fn dir_stats(dir: &Path) -> (u64, u64) {
+    let mut files = 0;
+    let mut bytes = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                stack.push(e.path());
+            } else if md.is_file() && e.file_name() != JOURNAL_FILE {
+                files += 1;
+                bytes += md.len();
+            }
+        }
+    }
+    (files, bytes)
 }
 
 /// Execute the plan. With `dry_run` nothing is touched and the report lists what would happen.
@@ -279,6 +329,7 @@ pub fn execute(plan: &Plan, dry_run: bool) -> anyhow::Result<ExecReport> {
         session_dir: session.clone(),
         entries: Vec::new(),
         undone: false,
+        purged: 0,
     };
     journal.save(&journal_path)?;
 
@@ -288,13 +339,18 @@ pub fn execute(plan: &Plan, dry_run: bool) -> anyhow::Result<ExecReport> {
     order.sort_by_key(|a| (a.is_dir, std::cmp::Reverse(a.source.components().count())));
 
     for action in order {
-        if action
-            .source
-            .starts_with(plan.root.join(QUARANTINE_DIR_NAME))
-        {
+        let quarantine = plan.root.join(QUARANTINE_DIR_NAME);
+        if action.source.starts_with(&quarantine) {
             report.failed.push((
                 action.source.clone(),
                 "liegt bereits in der Quarantäne".into(),
+            ));
+            continue;
+        }
+        if action.is_dir && quarantine.starts_with(&action.source) {
+            report.failed.push((
+                action.source.clone(),
+                "enthält den Quarantäne-Ordner selbst".into(),
             ));
             continue;
         }
@@ -306,7 +362,7 @@ pub fn execute(plan: &Plan, dry_run: bool) -> anyhow::Result<ExecReport> {
         }
         let dest = unique_destination(plan.destination(action, &session));
         let res = if action.is_dir {
-            move_empty_dir(&action.source, &dest)
+            move_dir(&action.source, &dest)
         } else {
             move_file(&action.source, &dest)
         };
@@ -354,17 +410,7 @@ pub fn undo(journal_path: &Path) -> anyhow::Result<UndoReport> {
             remaining.push(entry.clone());
             continue;
         }
-        let res = if entry.is_dir {
-            fs::create_dir_all(&entry.from).and_then(|_| {
-                if entry.to.exists() {
-                    fs::remove_dir(&entry.to)
-                } else {
-                    Ok(())
-                }
-            })
-        } else {
-            move_file(&entry.to, &entry.from)
-        };
+        let res = restore_entry(entry);
         match res {
             Ok(()) => {
                 report.restored += 1;
@@ -409,6 +455,140 @@ fn prune_empty_dirs(dir: &Path) {
             let _ = fs::remove_dir(&p); // only succeeds when empty
         }
     }
+}
+
+/// Move one journal entry back to its original place.
+fn restore_entry(entry: &JournalEntry) -> io::Result<()> {
+    if entry.is_dir {
+        if entry.to.exists() {
+            move_dir(&entry.to, &entry.from)
+        } else {
+            fs::create_dir_all(&entry.from)
+        }
+    } else {
+        move_file(&entry.to, &entry.from)
+    }
+}
+
+/// Restore a single entry (by index into `Journal::entries`) and drop it from the journal.
+pub fn undo_entry(journal_path: &Path, index: usize) -> anyhow::Result<()> {
+    let mut journal = Journal::load(journal_path)?;
+    let entry = journal
+        .entries
+        .get(index)
+        .cloned()
+        .context("Eintrag existiert nicht mehr im Journal")?;
+    if entry.from.exists() {
+        bail!(
+            "Originalpfad {} ist inzwischen wieder belegt",
+            entry.from.display()
+        );
+    }
+    restore_entry(&entry).with_context(|| format!("{} wiederherstellen", entry.to.display()))?;
+    remove_empty_parents(&entry.to, &journal.root);
+    journal.entries.remove(index);
+    journal.undone = journal.entries.is_empty() && journal.purged == 0;
+    journal.save(journal_path)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PurgeReport {
+    pub removed: usize,
+    pub bytes: u64,
+}
+
+fn assert_inside_quarantine(path: &Path, root: &Path) -> anyhow::Result<()> {
+    let q = root.join(QUARANTINE_DIR_NAME);
+    if !path.starts_with(&q) || path == q {
+        bail!(
+            "{} liegt nicht in der Quarantäne, wird nicht gelöscht",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Permanently delete a whole quarantine session, including its journal.
+/// This is the only place in tidyscan that deletes data, and it refuses anything
+/// outside `<root>/.tidyscan-quarantine/`.
+pub fn purge_session(journal_path: &Path) -> anyhow::Result<PurgeReport> {
+    let journal = Journal::load(journal_path)?;
+    assert_inside_quarantine(&journal.session_dir, &journal.root)?;
+    let (removed, bytes) = dir_stats(&journal.session_dir);
+    fs::remove_dir_all(&journal.session_dir)
+        .with_context(|| format!("{} löschen", journal.session_dir.display()))?;
+    Ok(PurgeReport {
+        removed: removed as usize,
+        bytes,
+    })
+}
+
+/// Permanently delete one entry's quarantined copy and drop it from the journal.
+pub fn purge_entry(journal_path: &Path, index: usize) -> anyhow::Result<PurgeReport> {
+    let mut journal = Journal::load(journal_path)?;
+    let entry = journal
+        .entries
+        .get(index)
+        .cloned()
+        .context("Eintrag existiert nicht mehr im Journal")?;
+    assert_inside_quarantine(&entry.to, &journal.root)?;
+    let report = if entry.to.is_dir() {
+        let (n, b) = dir_stats(&entry.to);
+        fs::remove_dir_all(&entry.to)?;
+        PurgeReport {
+            removed: n as usize,
+            bytes: b,
+        }
+    } else if entry.to.is_file() {
+        let b = fs::metadata(&entry.to).map(|m| m.len()).unwrap_or(0);
+        fs::remove_file(&entry.to)?;
+        PurgeReport {
+            removed: 1,
+            bytes: b,
+        }
+    } else {
+        PurgeReport::default()
+    };
+    remove_empty_parents(&entry.to, &journal.root);
+    journal.entries.remove(index);
+    journal.purged += 1;
+    journal.save(journal_path)?;
+    Ok(report)
+}
+
+/// Overview of one quarantine session for listings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub journal_path: PathBuf,
+    pub session_dir: PathBuf,
+    pub name: String,
+    pub created: String,
+    pub entries: usize,
+    pub purged: usize,
+    pub undone: bool,
+    pub files: u64,
+    pub bytes: u64,
+}
+
+pub fn session_info(journal_path: &Path) -> Option<SessionInfo> {
+    let j = Journal::load(journal_path).ok()?;
+    let (files, bytes) = dir_stats(&j.session_dir);
+    Some(SessionInfo {
+        journal_path: journal_path.to_path_buf(),
+        name: j
+            .session_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        session_dir: j.session_dir,
+        created: j.created,
+        entries: j.entries.len(),
+        purged: j.purged,
+        undone: j.undone,
+        files,
+        bytes,
+    })
 }
 
 /// All journals under `<root>/.tidyscan-quarantine`, newest first.

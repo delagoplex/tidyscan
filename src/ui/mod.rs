@@ -4,6 +4,7 @@ mod auto;
 mod cleanup;
 mod lists;
 mod overview;
+mod quarantine;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,6 +30,7 @@ pub enum Tab {
     Empty,
     Auto,
     Cleanup,
+    Quarantine,
 }
 
 struct ScanJob {
@@ -160,6 +162,7 @@ pub struct App {
 
     // Automatik
     pub(crate) auto: auto::AutoState,
+    pub(crate) quarantine: quarantine::QuarantineState,
 }
 
 impl App {
@@ -183,7 +186,12 @@ impl App {
             result: None,
             cat_sizes: Vec::new(),
             now: SystemTime::now(),
-            tab: Tab::Overview,
+            tab: match std::env::var("TIDYSCAN_TAB").as_deref() {
+                Ok("quarantine") => Tab::Quarantine,
+                Ok("cleanup") => Tab::Cleanup,
+                Ok("auto") => Tab::Auto,
+                _ => Tab::Overview,
+            },
             status: "Ordner wählen und Scan starten.".into(),
             error: None,
             auto_scan,
@@ -210,6 +218,7 @@ impl App {
             last_report: None,
             journals: Vec::new(),
             auto: auto::AutoState::new(),
+            quarantine: quarantine::QuarantineState::default(),
         }
     }
 
@@ -303,6 +312,7 @@ impl App {
                     self.empty_dirs = crate::dupes::empty_dirs_toplevel(&r);
                     self.zero_files = crate::dupes::zero_byte_files(&r);
                     self.journals = crate::actions::list_journals(&r.root);
+                    self.quarantine.stale = true;
                     self.selected_dir = 0;
                     self.detail_cache = None;
                     self.old_dirty = true;
@@ -523,11 +533,12 @@ impl eframe::App for App {
                     format!("Aufräumen ({})", self.selection.len())
                 };
                 ui.selectable_value(&mut self.tab, Tab::Cleanup, label);
+                ui.selectable_value(&mut self.tab, Tab::Quarantine, "Quarantäne");
             });
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            if self.result.is_none() && self.tab != Tab::Cleanup {
+            if self.result.is_none() && !matches!(self.tab, Tab::Cleanup | Tab::Quarantine) {
                 ui.centered_and_justified(|ui| {
                     ui.label(if self.scanning() {
                         "Scan läuft …"
@@ -544,6 +555,7 @@ impl eframe::App for App {
                 Tab::Empty => lists::show_empty(self, ui),
                 Tab::Auto => auto::show(self, ui, &ctx),
                 Tab::Cleanup => cleanup::show(self, ui, &ctx),
+                Tab::Quarantine => quarantine::show(self, ui, &ctx),
             }
         });
     }

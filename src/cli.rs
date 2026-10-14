@@ -1,4 +1,5 @@
-//! Command-line interface. Every subcommand except `clean --apply` and `undo` is read-only.
+//! Command-line interface. Read-only unless `--apply` is given; `undo` moves things
+//! back and `purge --yes` is the one command that deletes.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -339,10 +340,11 @@ pub fn run(cli: Cli) -> anyhow::Result<Option<Option<PathBuf>>> {
             let path = match (journal, root) {
                 (Some(j), _) if j.is_dir() => j.join(actions::JOURNAL_FILE),
                 (Some(j), _) => j,
+                // The newest session that still has something to give back.
                 (None, Some(r)) => actions::list_journals(&r)
                     .into_iter()
-                    .next()
-                    .context("Keine Quarantäne-Sitzung unter diesem Root gefunden")?,
+                    .find(|j| actions::Journal::load(j).is_ok_and(|j| !j.entries.is_empty()))
+                    .context("Keine Quarantäne-Sitzung mit wiederherstellbaren Einträgen unter diesem Root gefunden")?,
                 (None, None) => anyhow::bail!("Bitte Journal-Pfad oder --root angeben"),
             };
             let rep = actions::undo(&path)?;
@@ -369,7 +371,7 @@ pub fn run(cli: Cli) -> anyhow::Result<Option<Option<PathBuf>>> {
             } else {
                 Some(dupes::find_duplicates(
                     &result,
-                    1,
+                    TriageOptions::default().dupes_min_size,
                     Arc::new(AtomicBool::new(false)),
                     None,
                 ))
@@ -382,8 +384,8 @@ pub fn run(cli: Cli) -> anyhow::Result<Option<Option<PathBuf>>> {
                 now,
             );
             if json {
-                println!("{}", serde_json::to_string_pretty(&t)?);
-                return Ok(None);
+                let plan = t.to_plan(&result.root, include_unsure);
+                return finish_json(&t, &plan, apply);
             }
             for n in &t.notes {
                 println!("{n}");
@@ -414,8 +416,8 @@ pub fn run(cli: Cli) -> anyhow::Result<Option<Option<PathBuf>>> {
             };
             let p = organize::plan_organize(&result, &ctx, &opts, now);
             if json {
-                println!("{}", serde_json::to_string_pretty(&p)?);
-                return Ok(None);
+                let plan = p.to_plan(&result.root, include_unsure);
+                return finish_json(&p, &plan, apply);
             }
             for n in &p.notes {
                 println!("{n}");
@@ -456,9 +458,10 @@ pub fn run(cli: Cli) -> anyhow::Result<Option<Option<PathBuf>>> {
                 (Some(j), _) if j.is_dir() => vec![j.join(actions::JOURNAL_FILE)],
                 (Some(j), _) => vec![j],
                 (None, Some(r)) => {
+                    // Newest first, so the oldest session is the last one.
                     let mut js = actions::list_journals(&r);
                     if !all {
-                        js.truncate(1);
+                        js = js.pop().into_iter().collect();
                     }
                     js
                 }
@@ -693,6 +696,23 @@ fn print_after(after: &AfterTree) {
             println!("      … und {} weitere", f.incoming.len() - 8);
         }
     }
+}
+
+/// JSON output of an automatic mode. Without `--apply` the proposal itself, with it
+/// an object holding the proposal and the report of what was done.
+fn finish_json<T: serde::Serialize>(
+    proposal: &T,
+    plan: &Plan,
+    apply: bool,
+) -> anyhow::Result<Option<Option<PathBuf>>> {
+    if apply {
+        let report = actions::execute(plan, false)?;
+        let out = serde_json::json!({ "proposal": proposal, "report": report });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!("{}", serde_json::to_string_pretty(proposal)?);
+    }
+    Ok(None)
 }
 
 fn finish_auto(plan: &Plan, apply: bool) -> anyhow::Result<()> {

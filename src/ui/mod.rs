@@ -12,15 +12,16 @@ mod treemap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
-use crossbeam_channel::{Receiver, unbounded};
+use crossbeam_channel::{Receiver, TryRecvError, unbounded};
 use eframe::egui;
 
 use crate::actions::{Action, Plan};
 use crate::age::{AgeBasis, AtimeReport, OldFile};
 use crate::analysis::{self, CategorySizes, human};
+use crate::context::DirContext;
 use crate::dupes::DupeGroup;
 use crate::model::{DirId, FileId, ScanResult};
 use crate::scan::{self, ScanOptions, ScanProgress};
@@ -38,7 +39,7 @@ pub enum Tab {
 
 struct ScanJob {
     progress_rx: Receiver<ScanProgress>,
-    done_rx: Receiver<anyhow::Result<ScanResult>>,
+    done_rx: Receiver<anyhow::Result<(ScanResult, DirContext)>>,
     cancel: Arc<AtomicBool>,
     last: ScanProgress,
 }
@@ -47,12 +48,52 @@ struct DupeJob {
     done_rx: Receiver<Vec<DupeGroup>>,
     cancel: Arc<AtomicBool>,
     counters: Arc<(AtomicU64, AtomicU64)>,
+    min_size: u64,
+}
+
+/// Progress of a disk operation, written by the worker and read by the UI.
+#[derive(Clone, Default)]
+pub(crate) struct WorkProgress(Arc<(AtomicUsize, AtomicUsize)>);
+
+impl WorkProgress {
+    pub(crate) fn set(&self, done: usize, total: usize) {
+        self.0.0.store(done, Ordering::Relaxed);
+        self.0.1.store(total, Ordering::Relaxed);
+    }
+
+    fn get(&self) -> (usize, usize) {
+        (
+            self.0.0.load(Ordering::Relaxed),
+            self.0.1.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// What the UI does once a disk operation has finished.
+pub(crate) enum AfterWork {
+    /// A plan ran: show the report in the Aufräumen tab and scan `root` again.
+    Executed { root: PathBuf },
+    /// The quarantine changed. `tree_changed` when something came back into the
+    /// scanned folder, which makes the current scan outdated.
+    Quarantine { tree_changed: bool },
+}
+
+/// A disk operation running on a background thread. While it runs, a modal keeps
+/// the rest of the UI from starting something that would overlap with it.
+struct Work {
+    title: String,
+    progress: WorkProgress,
+    rx: Receiver<String>,
+    then: AfterWork,
 }
 
 /// The set of actions the user has ticked, keyed by source path.
 #[derive(Default)]
 pub struct Selection {
     items: HashMap<PathBuf, Action>,
+    /// The sorted plan for the current items, built on demand and reused across
+    /// frames until the selection changes.
+    plan: Option<Arc<Plan>>,
 }
 
 impl Selection {
@@ -60,17 +101,21 @@ impl Selection {
         self.items.contains_key(p)
     }
     pub fn toggle(&mut self, action: Action) {
+        self.plan = None;
         if self.items.remove(&action.source).is_none() {
             self.items.insert(action.source.clone(), action);
         }
     }
     pub fn insert(&mut self, action: Action) {
+        self.plan = None;
         self.items.insert(action.source.clone(), action);
     }
     pub fn remove(&mut self, p: &Path) {
+        self.plan = None;
         self.items.remove(p);
     }
     pub fn clear(&mut self) {
+        self.plan = None;
         self.items.clear();
     }
     pub fn len(&self) -> usize {
@@ -82,13 +127,18 @@ impl Selection {
     pub fn total_bytes(&self) -> u64 {
         self.items.values().map(|a| a.size).sum()
     }
-    pub fn to_plan(&self, root: &Path) -> Plan {
-        let mut plan = Plan::new(root);
-        let mut actions: Vec<Action> = self.items.values().cloned().collect();
-        actions.sort_by(|a, b| a.source.cmp(&b.source));
-        for a in actions {
-            plan.push(a);
+    /// The selection as a plan for `root`, sorted by source path.
+    pub fn plan(&mut self, root: &Path) -> Arc<Plan> {
+        if let Some(p) = &self.plan
+            && p.root == root
+        {
+            return p.clone();
         }
+        let mut plan = Plan::new(root);
+        plan.actions = self.items.values().cloned().collect();
+        plan.actions.sort_by(|a, b| a.source.cmp(&b.source));
+        let plan = Arc::new(plan);
+        self.plan = Some(plan.clone());
         plan
     }
 }
@@ -96,6 +146,11 @@ impl Selection {
 /// Quarantine a file as the scan saw it; a file changed since then is skipped at run time.
 pub fn file_action(result: &ScanResult, id: FileId, reason: &str) -> Action {
     Action::quarantine_file(&result.files[id], reason)
+}
+
+/// Quarantine a duplicate on the condition that the copy `keep` is still there, unchanged.
+pub fn dupe_action(result: &ScanResult, id: FileId, keep: FileId) -> Action {
+    file_action(result, id, "Duplikat").keeping(&result.files[keep])
 }
 
 /// Quarantine a folder the scan found empty; it is skipped if it has content at run time.
@@ -115,6 +170,8 @@ pub struct App {
     pub(crate) exclude_text: String,
     scan_job: Option<ScanJob>,
     pub(crate) result: Option<Arc<ScanResult>>,
+    /// Projects, protected areas and folder roles of `result`, computed with the scan.
+    pub(crate) ctx: Option<Arc<DirContext>>,
     pub(crate) cat_sizes: CategorySizes,
     pub(crate) now: SystemTime,
     pub(crate) tab: Tab,
@@ -146,7 +203,9 @@ pub struct App {
 
     // Duplicates / empties
     pub(crate) dupe_min_size: String,
-    pub(crate) dupes: Option<Vec<DupeGroup>>,
+    pub(crate) dupes: Option<Arc<Vec<DupeGroup>>>,
+    /// Minimum file size the groups in `dupes` were searched with.
+    pub(crate) dupes_min: u64,
     dupe_job: Option<DupeJob>,
     pub(crate) empty_dirs: Vec<DirId>,
     pub(crate) zero_files: Vec<FileId>,
@@ -157,7 +216,11 @@ pub struct App {
     pub(crate) rules_error: Option<String>,
     pub(crate) confirm_execute: bool,
     pub(crate) last_report: Option<String>,
-    pub(crate) journals: Vec<PathBuf>,
+    work: Option<Work>,
+    /// Something was restored into the scanned folder since the scan.
+    pub(crate) scan_outdated: bool,
+    /// Resolved form of the folder field, for the quarantine tab without a scan.
+    typed_root: Option<(String, Option<PathBuf>)>,
 
     // Automatik
     pub(crate) auto: auto::AutoState,
@@ -184,6 +247,7 @@ impl App {
             exclude_text: "**/node_modules\n**/.git".into(),
             scan_job: None,
             result: None,
+            ctx: None,
             cat_sizes: Vec::new(),
             now: SystemTime::now(),
             tab: match std::env::var("TIDYSCAN_TAB").as_deref() {
@@ -211,6 +275,7 @@ impl App {
             old_filter_applied: None,
             dupe_min_size: "1M".into(),
             dupes: None,
+            dupes_min: 0,
             dupe_job: None,
             empty_dirs: Vec::new(),
             zero_files: Vec::new(),
@@ -219,14 +284,41 @@ impl App {
             rules_error: None,
             confirm_execute: false,
             last_report: None,
-            journals: Vec::new(),
+            work: None,
+            scan_outdated: false,
+            typed_root: None,
             auto: auto::AutoState::new(),
             quarantine: quarantine::QuarantineState::default(),
         }
     }
 
+    /// The folder typed into the field. Only this starts a scan; plans and the
+    /// quarantine always refer to the folder that was actually scanned.
     pub(crate) fn root(&self) -> PathBuf {
         PathBuf::from(self.root_text.trim())
+    }
+
+    /// Root of the current scan, in the canonical form all its paths start with.
+    pub(crate) fn scanned_root(&self) -> Option<PathBuf> {
+        self.result.as_ref().map(|r| r.root.clone())
+    }
+
+    /// Whose quarantine the Quarantäne tab shows: the scanned folder, or before any
+    /// scan the folder typed into the field.
+    pub(crate) fn quarantine_root(&mut self) -> Option<PathBuf> {
+        if let Some(r) = self.scanned_root() {
+            return Some(r);
+        }
+        let text = self.root_text.trim();
+        if self.typed_root.as_ref().is_none_or(|(t, _)| t != text) {
+            let resolved = dunce::canonicalize(text).ok().filter(|p| p.is_dir());
+            self.typed_root = Some((text.to_string(), resolved));
+        }
+        self.typed_root.as_ref().and_then(|(_, p)| p.clone())
+    }
+
+    pub(crate) fn working(&self) -> bool {
+        self.work.is_some()
     }
 
     pub(crate) fn scanning(&self) -> bool {
@@ -252,7 +344,18 @@ impl App {
     }
 
     pub(crate) fn start_scan(&mut self) {
-        let root = self.root();
+        self.start_scan_at(self.root());
+    }
+
+    /// Scan the folder of the current result again, whatever the field says by now.
+    pub(crate) fn rescan(&mut self) {
+        match self.scanned_root() {
+            Some(root) => self.start_scan_at(root),
+            None => self.start_scan(),
+        }
+    }
+
+    fn start_scan_at(&mut self, root: PathBuf) {
         if !root.is_dir() {
             self.error = Some(format!("{} ist kein Ordner.", root.display()));
             return;
@@ -260,9 +363,11 @@ impl App {
         self.error = None;
         self.cancel_dupes();
         self.result = None;
+        self.ctx = None;
         self.dupes = None;
         self.selection.clear();
         self.last_report = None;
+        self.scan_outdated = false;
         self.auto.reset();
         self.status = format!("Scanne {} …", root.display());
 
@@ -272,7 +377,11 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let c2 = cancel.clone();
         std::thread::spawn(move || {
-            let r = scan::scan(&root, &opts, Some(ptx), c2);
+            // The context costs disk lookups, so it is built here and not on the UI thread.
+            let r = scan::scan(&root, &opts, Some(ptx), c2).map(|r| {
+                let ctx = crate::context::build(&r);
+                (r, ctx)
+            });
             let _ = dtx.send(r);
         });
         self.scan_job = Some(ScanJob {
@@ -296,10 +405,19 @@ impl App {
         while let Ok(p) = job.progress_rx.try_recv() {
             job.last = p;
         }
-        if let Ok(res) = job.done_rx.try_recv() {
+        let res = match job.done_rx.try_recv() {
+            Ok(res) => res,
+            Err(TryRecvError::Empty) => return,
+            // The worker is gone without an answer: it panicked.
+            Err(TryRecvError::Disconnected) => {
+                Err(anyhow::anyhow!("der Scan wurde unerwartet beendet"))
+            }
+        };
+        {
             self.scan_job = None;
             match res {
-                Ok(r) => {
+                Ok((r, ctx)) => {
+                    self.ctx = Some(Arc::new(ctx));
                     self.now = SystemTime::now();
                     self.status = format!(
                         "{}{} Dateien, {} Ordner, {} in {:.1?}. {} Fehler, {} übersprungen.",
@@ -319,7 +437,6 @@ impl App {
                     self.atime = Some(crate::age::atime_report(&r));
                     self.empty_dirs = crate::dupes::empty_dirs_toplevel(&r);
                     self.zero_files = crate::dupes::zero_byte_files(&r);
-                    self.journals = crate::actions::list_journals(&r.root);
                     self.quarantine.stale = true;
                     self.selected_dir = 0;
                     self.detail_cache = None;
@@ -377,6 +494,7 @@ impl App {
             done_rx: rx,
             cancel,
             counters,
+            min_size: min,
         });
     }
 
@@ -389,9 +507,17 @@ impl App {
 
     fn poll_dupes(&mut self) {
         let Some(job) = &self.dupe_job else { return };
-        if let Ok(groups) = job.done_rx.try_recv() {
-            self.dupes = Some(groups);
-            self.dupe_job = None;
+        match job.done_rx.try_recv() {
+            Ok(groups) => {
+                self.dupes = Some(Arc::new(groups));
+                self.dupes_min = job.min_size;
+                self.dupe_job = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.dupe_job = None;
+                self.error = Some("Die Duplikatsuche wurde unerwartet beendet.".into());
+            }
         }
     }
 
@@ -404,16 +530,118 @@ impl App {
         })
     }
 
-    /// Execute a plan, report, and rescan. Shared by the Aufräumen and Automatik tabs.
-    pub(crate) fn execute_plan(&mut self, plan: Plan) {
-        let msg = match crate::actions::execute(&plan, false) {
-            Ok(rep) => rep.summary(15),
-            Err(e) => format!("Ausführen fehlgeschlagen: {e:#}"),
+    /// Run a disk operation in the background. `job` returns the message to show.
+    pub(crate) fn run_work(
+        &mut self,
+        title: impl Into<String>,
+        then: AfterWork,
+        job: impl FnOnce(&WorkProgress) -> String + Send + 'static,
+    ) {
+        if self.work.is_some() {
+            return;
+        }
+        let progress = WorkProgress::default();
+        let (tx, rx) = unbounded();
+        let p = progress.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(job(&p));
+        });
+        self.work = Some(Work {
+            title: title.into(),
+            progress,
+            rx,
+            then,
+        });
+    }
+
+    fn poll_work(&mut self) {
+        let Some(work) = &self.work else { return };
+        let msg = match work.rx.try_recv() {
+            Ok(msg) => msg,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                "Der Vorgang wurde unerwartet beendet. Was bis dahin verschoben wurde, steht im Journal der Sitzung (Tab Quarantäne)."
+                    .to_string()
+            }
         };
-        self.selection.clear();
-        self.start_scan();
-        self.last_report = Some(msg);
-        self.journals = crate::actions::list_journals(&self.root());
+        let Some(work) = self.work.take() else { return };
+        self.quarantine.stale = true;
+        match work.then {
+            AfterWork::Executed { root } => {
+                self.selection.clear();
+                self.start_scan_at(root);
+                self.last_report = Some(msg);
+            }
+            AfterWork::Quarantine { tree_changed } => {
+                self.quarantine.message = Some(msg);
+                self.scan_outdated |= tree_changed && self.result.is_some();
+            }
+        }
+    }
+
+    /// Execute a plan in the background, report, and rescan. Shared by the Aufräumen
+    /// and Automatik tabs.
+    pub(crate) fn execute_plan(&mut self, plan: Plan) {
+        let total = plan.len();
+        let then = AfterWork::Executed {
+            root: plan.root.clone(),
+        };
+        self.run_work("Plan wird ausgeführt", then, move |progress| {
+            progress.set(0, total);
+            let run =
+                crate::actions::execute_with(&plan, false, &mut |done| progress.set(done, total));
+            match run {
+                Ok(rep) => rep.summary(15),
+                Err(e) => format!("Ausführen fehlgeschlagen: {e:#}"),
+            }
+        });
+    }
+
+    /// Development hook, debug builds only: with `TIDYSCAN_AUTORUN` set, the first
+    /// computed proposal is executed without a click, so the whole path from plan to
+    /// report can be watched without a pointing device.
+    #[cfg(debug_assertions)]
+    fn debug_autorun(&mut self) {
+        if self.auto.items.is_empty() || self.auto.busy() || self.working() {
+            return;
+        }
+        if std::env::var_os("TIDYSCAN_AUTORUN").is_none() || self.last_report.is_some() {
+            return;
+        }
+        if let Some(root) = self.scanned_root() {
+            let plan = self.auto.checked_plan(&root);
+            self.tab = Tab::Cleanup;
+            self.execute_plan(plan);
+        }
+    }
+
+    fn work_modal(&self, ctx: &egui::Context) {
+        let Some(work) = &self.work else { return };
+        let (done, total) = work.progress.get();
+        egui::Modal::new(egui::Id::new("work")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.heading(&work.title);
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().color(theme::ACCENT));
+                if total > 0 {
+                    ui.label(format!("{done} von {total}"));
+                } else {
+                    ui.label("läuft …");
+                }
+            });
+            if total > 0 {
+                ui.add(egui::ProgressBar::new(done as f32 / total as f32));
+            }
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "Bitte das Fenster geöffnet lassen, bis der Vorgang fertig ist.",
+                )
+                .small()
+                .color(theme::TEXT_DIM),
+            );
+        });
     }
 
     pub(crate) fn pick_folder(&mut self) {
@@ -508,6 +736,31 @@ impl App {
             if let Some(e) = &self.error {
                 ui.colored_label(theme::RED, e);
             }
+            if let Some(root) = self.scanned_root() {
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("Gescannt: {}", root.display()))
+                            .small()
+                            .color(theme::TEXT_DIM),
+                    )
+                    .truncate(),
+                );
+            }
+            if self.scan_outdated {
+                ui.add_space(6.0);
+                theme::pill(
+                    ui,
+                    "Scan veraltet: es wurde etwas wiederhergestellt",
+                    theme::AMBER,
+                );
+                if ui
+                    .add_enabled(!self.scanning(), egui::Button::new("Neu scannen"))
+                    .clicked()
+                {
+                    self.rescan();
+                }
+            }
             if !self.selection.is_empty() {
                 ui.add_space(6.0);
                 theme::pill(
@@ -535,8 +788,11 @@ impl eframe::App for App {
         }
         self.poll_scan();
         self.poll_dupes();
+        self.poll_work();
         auto::poll(self);
-        if self.scanning() || self.dupes_running() || self.auto.busy() {
+        #[cfg(debug_assertions)]
+        self.debug_autorun();
+        if self.scanning() || self.dupes_running() || self.auto.busy() || self.working() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
@@ -596,6 +852,7 @@ impl eframe::App for App {
                 Tab::Quarantine => quarantine::show(self, ui, &ctx),
             }
         });
+        self.work_modal(&ctx);
     }
 }
 
@@ -614,7 +871,6 @@ fn detach_console() {
 fn detach_console() {}
 
 pub fn run(preset: Option<PathBuf>) -> anyhow::Result<()> {
-    detach_console();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1500.0, 900.0])
@@ -625,7 +881,12 @@ pub fn run(preset: Option<PathBuf>) -> anyhow::Result<()> {
     eframe::run_native(
         "tidyscan",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, preset)))),
+        Box::new(move |cc| {
+            // Only now is it certain that a window exists. Detaching earlier would
+            // swallow the message when the GUI cannot start at all.
+            detach_console();
+            Ok(Box::new(App::new(cc, preset)))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
 }

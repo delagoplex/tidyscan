@@ -331,8 +331,12 @@ fn has_project_marker(result: &ScanResult, dir: DirId) -> bool {
         }
         weak += usize::from(is_marker(WEAK_PROJECT_MARKERS, &name));
     }
+    if weak >= 2 {
+        return true;
+    }
     // Markers like `.git` are usually excluded from the scan, so look at the disk.
-    weak >= 2 || VCS_DIRS.iter().any(|m| node.path.join(m).is_dir())
+    // That is only needed where the scan actually left something out.
+    (node.own_skipped > 0 || node.own_unread) && VCS_DIRS.iter().any(|m| node.path.join(m).is_dir())
 }
 
 /// Like [`has_project_marker`] for a directory the scan did not cover.

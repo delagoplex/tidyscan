@@ -235,3 +235,74 @@ pub fn section_heading(ui: &mut Ui, text: &str, color: Color32) {
         ui.label(egui::RichText::new(text).size(17.0).strong().color(TEXT));
     });
 }
+
+/// Expand/collapse toggle drawn with the painter (the UI font lacks solid triangles).
+/// A `leaf` only takes up the space, so rows stay aligned.
+pub fn disclosure(ui: &mut Ui, open: bool, leaf: bool) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
+    if leaf {
+        return resp;
+    }
+    let c = rect.center();
+    let color = if resp.hovered() { TEXT } else { TEXT_DIM };
+    let pts = if open {
+        vec![
+            c + vec2(-4.5, -2.5),
+            c + vec2(4.5, -2.5),
+            c + vec2(0.0, 3.0),
+        ]
+    } else {
+        vec![
+            c + vec2(-2.5, -4.5),
+            c + vec2(3.0, 0.0),
+            c + vec2(-2.5, 4.5),
+        ]
+    };
+    ui.painter()
+        .add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+    resp
+}
+
+/// What the user did with a confirmation dialog this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    Pending,
+    Cancelled,
+    Confirmed,
+}
+
+/// A modal question with a cancel button and one action button. `danger` paints the
+/// action red, for things that cannot be undone.
+pub fn confirm(
+    ctx: &egui::Context,
+    id: &str,
+    title: &str,
+    action: &str,
+    danger: bool,
+    body: impl FnOnce(&mut Ui),
+) -> Answer {
+    let mut answer = Answer::Pending;
+    let modal = egui::Modal::new(egui::Id::new(id)).show(ctx, |ui| {
+        ui.set_width(460.0);
+        ui.heading(title);
+        body(ui);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("Abbrechen").clicked() {
+                answer = Answer::Cancelled;
+            }
+            let clicked = if danger {
+                danger_button(ui, action).clicked()
+            } else {
+                primary_button(ui, action).clicked()
+            };
+            if clicked {
+                answer = Answer::Confirmed;
+            }
+        });
+    });
+    if answer == Answer::Pending && modal.should_close() {
+        answer = Answer::Cancelled;
+    }
+    answer
+}

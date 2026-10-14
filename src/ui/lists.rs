@@ -3,7 +3,7 @@
 use eframe::egui::{self, Ui};
 use egui_extras::{Column, TableBuilder};
 
-use super::{App, empty_dir_action, file_action, reveal};
+use super::{App, dupe_action, empty_dir_action, file_action, reveal};
 use crate::age::AgeBasis;
 use crate::analysis::human;
 
@@ -17,14 +17,13 @@ pub fn show_old(app: &mut App, ui: &mut Ui) {
 
     ui.horizontal(|ui| {
         ui.label("Unverändert seit");
-        if ui
-            .add(
-                egui::Slider::new(&mut app.old_days, 7..=3650)
-                    .logarithmic(true)
-                    .suffix(" Tagen"),
-            )
-            .changed()
-        {
+        let slider = ui.add(
+            egui::Slider::new(&mut app.old_days, 7..=3650)
+                .logarithmic(true)
+                .suffix(" Tagen"),
+        );
+        // Recomputing sorts every file: once when the drag ends, not on every pixel.
+        if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
             app.old_dirty = true;
         }
         ui.separator();
@@ -187,14 +186,14 @@ pub fn show_dupes(app: &mut App, ui: &mut Ui) {
             .button("Überall alle außer der ersten Datei markieren")
             .clicked()
         {
-            for g in &groups {
+            for g in groups.iter() {
                 for &fid in g.files.iter().skip(1) {
-                    app.selection.insert(file_action(&result, fid, "Duplikat"));
+                    app.selection.insert(dupe_action(&result, fid, g.files[0]));
                 }
             }
         }
         if ui.button("Duplikat-Markierungen aufheben").clicked() {
-            for g in &groups {
+            for g in groups.iter() {
                 for &fid in &g.files {
                     app.selection.remove(&result.files[fid].path);
                 }
@@ -219,7 +218,7 @@ pub fn show_dupes(app: &mut App, ui: &mut Ui) {
                     .show(ui, |ui| {
                         if ui.small_button("Alle außer der ersten markieren").clicked() {
                             for &fid in g.files.iter().skip(1) {
-                                app.selection.insert(file_action(&result, fid, "Duplikat"));
+                                app.selection.insert(dupe_action(&result, fid, g.files[0]));
                             }
                         }
                         for &fid in &g.files {
@@ -281,8 +280,8 @@ pub fn show_empty(app: &mut App, ui: &mut Ui) {
         .id_salt("empty_dirs")
         .max_height(half)
         .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for &d in &app.empty_dirs.clone() {
+        .show_rows(ui, ROW, app.empty_dirs.len(), |ui, rows| {
+            for d in app.empty_dirs[rows].iter().copied() {
                 let node = &result.dirs[d];
                 ui.horizontal(|ui| {
                     let mut checked = app.selection.contains(&node.path);

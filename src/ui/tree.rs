@@ -262,7 +262,7 @@ pub fn show(app: &mut App, result: &ScanResult, ui: &mut Ui) {
                             ui.add_space(depth as f32 * 16.0);
                             let leaf = node.children.is_empty()
                                 && (node.files.is_empty() || !app.tree.show_files);
-                            if triangle(ui, expanded, leaf).clicked() {
+                            if theme::disclosure(ui, expanded, leaf).clicked() {
                                 toggle = Some(d);
                             }
                             folder_icon(ui, theme::ACCENT);
@@ -377,36 +377,6 @@ fn file_icon(ui: &mut Ui, color: egui::Color32) {
     let r = egui::Rect::from_center_size(rect.center(), egui::vec2(9.0, 12.0));
     ui.painter()
         .rect_filled(r, egui::CornerRadius::same(2), color.gamma_multiply(0.7));
-}
-
-/// Expand/collapse toggle drawn with the painter (the UI font lacks a solid down triangle).
-fn triangle(ui: &mut Ui, open: bool, leaf: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
-    if leaf {
-        return resp;
-    }
-    let c = rect.center();
-    let color = if resp.hovered() {
-        theme::TEXT
-    } else {
-        theme::TEXT_DIM
-    };
-    let pts = if open {
-        vec![
-            c + egui::vec2(-4.5, -2.5),
-            c + egui::vec2(4.5, -2.5),
-            c + egui::vec2(0.0, 3.0),
-        ]
-    } else {
-        vec![
-            c + egui::vec2(-2.5, -4.5),
-            c + egui::vec2(3.0, 0.0),
-            c + egui::vec2(-2.5, 4.5),
-        ]
-    };
-    ui.painter()
-        .add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
-    resp
 }
 
 fn sort_marker(ui: &mut Ui, desc: bool) {

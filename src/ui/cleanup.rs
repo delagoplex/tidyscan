@@ -1,4 +1,4 @@
-//! Cleanup tab: review the plan, apply rule files, execute into quarantine, undo.
+//! Cleanup tab: review the plan, apply rule files, execute into quarantine.
 
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -9,6 +9,7 @@ use egui_extras::{Column, TableBuilder};
 use super::{App, theme};
 use crate::analysis::human;
 use crate::rules;
+use crate::scan::QUARANTINE_DIR_NAME;
 
 const ROW: f32 = 20.0;
 
@@ -32,16 +33,16 @@ fn plan_section(app: &mut App, ui: &mut Ui) {
     theme::section_heading(ui, "Plan", theme::ACCENT);
     ui.weak(
         "Nichts wird gelöscht. Einträge wandern in <Ordner>/.tidyscan-quarantine/<Zeitstempel>/ \
-         (oder in das Regel-Ziel) und können jederzeit zurückgeholt werden.",
+         (oder in das Regel-Ziel) und können im Tab Quarantäne jederzeit zurückgeholt werden.",
     );
-    if app.selection.is_empty() {
+    // The plan belongs to the scanned folder; without a scan there is nothing to plan.
+    let Some(root) = app.scanned_root().filter(|_| !app.selection.is_empty()) else {
         ui.label(
             "Der Plan ist leer. In den anderen Tabs Häkchen setzen oder unten Regeln anwenden.",
         );
         return;
-    }
-    let root = app.root();
-    let plan = app.selection.to_plan(&root);
+    };
+    let plan = app.selection.plan(&root);
     ui.horizontal(|ui| {
         ui.label(format!(
             "{} Einträge, {}",
@@ -51,9 +52,8 @@ fn plan_section(app: &mut App, ui: &mut Ui) {
         if ui.button("Plan leeren").clicked() {
             app.selection.clear();
         }
-        let can_run = !app.scanning() && app.result.is_some();
         if ui
-            .add_enabled(can_run, egui::Button::new("Ausführen …"))
+            .add_enabled(!app.scanning(), egui::Button::new("Ausführen …"))
             .clicked()
         {
             app.confirm_execute = true;
@@ -88,8 +88,7 @@ fn plan_section(app: &mut App, ui: &mut Ui) {
         })
         .body(|body| {
             body.rows(ROW, plan.len(), |mut row| {
-                let i = row.index();
-                let a = &plan.actions[i];
+                let a = &plan.actions[row.index()];
                 row.col(|ui| {
                     ui.label(&a.reason);
                 });
@@ -120,7 +119,10 @@ fn plan_section(app: &mut App, ui: &mut Ui) {
 
 fn rules_section(app: &mut App, ui: &mut Ui) {
     theme::section_heading(ui, "Regeln", theme::ACCENT);
-    ui.weak("TOML-Regeldatei: Treffer werden dem Plan hinzugefügt. Erste passende Regel gewinnt.");
+    ui.weak(
+        "TOML-Regeldatei: Treffer werden dem Plan hinzugefügt. Erste passende Regel gewinnt. \
+         Geschützte Bereiche bleiben außen vor, Projektordner ohne include_projects ebenfalls.",
+    );
     ui.horizontal(|ui| {
         ui.add(
             egui::TextEdit::singleline(&mut app.rules_path)
@@ -154,18 +156,17 @@ fn rules_section(app: &mut App, ui: &mut Ui) {
         }
     });
     if let Some(e) = &app.rules_error {
-        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), e);
+        ui.colored_label(theme::RED, e);
     }
 }
 
 fn apply_rules(app: &mut App) {
-    let Some(result) = app.result.clone() else {
+    let (Some(result), Some(ctx)) = (app.result.clone(), app.ctx.clone()) else {
         return;
     };
     app.rules_error = None;
     match rules::load_rules(std::path::Path::new(app.rules_path.trim())) {
         Ok(compiled) => {
-            let ctx = crate::context::build(&result);
             let matches = rules::apply_rules(&result, &ctx, &compiled, SystemTime::now());
             let n = matches.plan.len();
             let note = matches.left_out().unwrap_or_default();
@@ -185,33 +186,32 @@ fn confirm_modal(app: &mut App, ctx: &egui::Context) {
     if !app.confirm_execute {
         return;
     }
-    let root = app.root();
-    let plan = app.selection.to_plan(&root);
-    let mut run = false;
-    let modal = egui::Modal::new(egui::Id::new("confirm_execute")).show(ctx, |ui| {
-        ui.set_width(420.0);
-        ui.heading("Plan ausführen?");
-        ui.label(format!(
-            "{} Einträge ({}) werden verschoben. Ziel für Quarantäne:\n{}",
-            plan.len(),
-            human(plan.total_bytes()),
-            root.join(crate::scan::QUARANTINE_DIR_NAME).display()
-        ));
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            if ui.button("Abbrechen").clicked() {
-                app.confirm_execute = false;
-            }
-            if ui.add(egui::Button::new("Ja, verschieben")).clicked() {
-                run = true;
-            }
-        });
-    });
-    if modal.should_close() {
+    let Some(root) = app.scanned_root() else {
         app.confirm_execute = false;
-    }
-    if run {
-        app.confirm_execute = false;
-        app.execute_plan(plan);
+        return;
+    };
+    let plan = app.selection.plan(&root);
+    let answer = theme::confirm(
+        ctx,
+        "confirm_execute",
+        "Plan ausführen?",
+        "Ja, verschieben",
+        false,
+        |ui| {
+            ui.label(format!(
+                "{} Einträge ({}) werden verschoben. Ziel für Quarantäne:\n{}",
+                plan.len(),
+                human(plan.total_bytes()),
+                root.join(QUARANTINE_DIR_NAME).display()
+            ));
+        },
+    );
+    match answer {
+        theme::Answer::Pending => {}
+        theme::Answer::Cancelled => app.confirm_execute = false,
+        theme::Answer::Confirmed => {
+            app.confirm_execute = false;
+            app.execute_plan((*plan).clone());
+        }
     }
 }

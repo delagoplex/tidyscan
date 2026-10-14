@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Ui};
 
-use super::{App, reveal, theme};
+use super::{AfterWork, App, reveal, theme};
 use crate::actions::{self, JournalEntry, SessionInfo};
 use crate::analysis::human;
+use crate::scan::QUARANTINE_DIR_NAME;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Purge {
@@ -21,7 +22,10 @@ pub struct QuarantineState {
     pub sessions: Vec<SessionInfo>,
     pub expanded: Option<PathBuf>,
     pub entries: Vec<JournalEntry>,
+    /// The disk changed; reload on the next frame.
     pub stale: bool,
+    /// Root the listing was loaded for. A different root means a different quarantine.
+    loaded_for: Option<PathBuf>,
     pub confirm: Option<Purge>,
     pub message: Option<String>,
 }
@@ -42,6 +46,7 @@ impl QuarantineState {
             }
         }
         self.stale = false;
+        self.loaded_for = Some(root.to_path_buf());
     }
 
     pub fn total_bytes(&self) -> u64 {
@@ -49,21 +54,104 @@ impl QuarantineState {
     }
 }
 
-fn after_change(app: &mut App, msg: String) {
-    app.quarantine.message = Some(msg);
-    app.quarantine.stale = true;
-    if app.result.is_some() && !app.scanning() {
-        app.start_scan();
+/// Up to ten conflict lines for a message.
+fn conflict_lines(conflicts: &[(PathBuf, String)]) -> String {
+    let mut out = String::new();
+    for (p, why) in conflicts.iter().take(10) {
+        out.push_str(&format!("\n  {}: {why}", p.display()));
     }
+    if conflicts.len() > 10 {
+        out.push_str(&format!("\n  … und {} weitere", conflicts.len() - 10));
+    }
+    out
+}
+
+fn restore_session(app: &mut App, journal: PathBuf) {
+    app.run_work(
+        "Sitzung wird wiederhergestellt",
+        AfterWork::Quarantine { tree_changed: true },
+        move |progress| match actions::undo_with(&journal, &mut |d, t| progress.set(d, t)) {
+            Ok(r) => format!(
+                "{} Einträge wiederhergestellt, {} Konflikte.{}",
+                r.restored,
+                r.conflicts.len(),
+                conflict_lines(&r.conflicts)
+            ),
+            Err(e) => format!("Wiederherstellen fehlgeschlagen: {e:#}"),
+        },
+    );
+}
+
+fn restore_entry(app: &mut App, journal: PathBuf, index: usize) {
+    app.run_work(
+        "Eintrag wird wiederhergestellt",
+        AfterWork::Quarantine { tree_changed: true },
+        move |_| match actions::undo_entry(&journal, index) {
+            Ok(()) => "Eintrag wiederhergestellt.".to_string(),
+            Err(e) => format!("Wiederherstellen fehlgeschlagen: {e:#}"),
+        },
+    );
+}
+
+fn purge(app: &mut App, what: Purge) {
+    let sessions: Vec<(String, PathBuf)> = app
+        .quarantine
+        .sessions
+        .iter()
+        .map(|s| (s.name.clone(), s.journal_path.clone()))
+        .collect();
+    app.quarantine.expanded = None;
+    app.quarantine.entries.clear();
+    app.run_work(
+        "Quarantäne wird gelöscht",
+        AfterWork::Quarantine {
+            tree_changed: false,
+        },
+        move |progress| match what {
+            Purge::Session(j) => match actions::purge_session(&j) {
+                Ok(r) => format!(
+                    "Sitzung gelöscht: {} Dateien, {} freigegeben.",
+                    r.removed,
+                    human(r.bytes)
+                ),
+                Err(e) => format!("Löschen fehlgeschlagen: {e:#}"),
+            },
+            Purge::Entry(j, i) => match actions::purge_entry(&j, i) {
+                Ok(r) => format!("Eintrag gelöscht, {} freigegeben.", human(r.bytes)),
+                Err(e) => format!("Löschen fehlgeschlagen: {e:#}"),
+            },
+            Purge::All => {
+                let (mut n, mut bytes, mut errors) = (0, 0, Vec::new());
+                for (i, (name, journal)) in sessions.iter().enumerate() {
+                    progress.set(i, sessions.len());
+                    match actions::purge_session(journal) {
+                        Ok(r) => {
+                            n += r.removed;
+                            bytes += r.bytes;
+                        }
+                        Err(e) => errors.push(format!("{name}: {e:#}")),
+                    }
+                }
+                let mut m = format!("{n} Dateien gelöscht, {} freigegeben.", human(bytes));
+                for e in errors {
+                    m.push_str(&format!("\n{e}"));
+                }
+                m
+            }
+        },
+    );
 }
 
 pub fn show(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
-    let root = app.root();
-    if app.quarantine.stale
-        || app.quarantine.sessions.is_empty() && app.quarantine.message.is_none()
-    {
+    let Some(root) = app.quarantine_root() else {
+        ui.heading("Quarantäne");
+        ui.label("Der Ordner im Feld links existiert nicht.");
+        return;
+    };
+    if app.quarantine.stale || app.quarantine.loaded_for.as_deref() != Some(root.as_path()) {
         app.quarantine.refresh(&root);
     }
+    let quarantine_dir = root.join(QUARANTINE_DIR_NAME);
 
     ui.horizontal(|ui| {
         ui.heading("Quarantäne");
@@ -76,13 +164,13 @@ pub fn show(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
             app.quarantine.refresh(&root);
         }
         if ui.small_button("Ordner anzeigen").clicked() {
-            reveal(&root.join(crate::scan::QUARANTINE_DIR_NAME));
+            reveal(&quarantine_dir);
         }
     });
     ui.weak(format!(
         "Alles unter {}. Wiederherstellen legt die Einträge an ihren Originalpfad zurück und überschreibt nichts. \
          Endgültig löschen ist die einzige Stelle, an der tidyscan Daten entfernt.",
-        root.join(crate::scan::QUARANTINE_DIR_NAME).display()
+        quarantine_dir.display()
     ));
     if let Some(m) = &app.quarantine.message {
         ui.label(egui::RichText::new(m).small());
@@ -113,23 +201,36 @@ pub fn show(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
     });
     ui.add_space(6.0);
 
-    let sessions = app.quarantine.sessions.clone();
-    let mut restore_session: Option<PathBuf> = None;
-    let mut restore_entry: Option<(PathBuf, usize)> = None;
-    let mut toggle_expand: Option<PathBuf> = None;
+    enum Click {
+        Expand(PathBuf),
+        RestoreSession(PathBuf),
+        RestoreEntry(PathBuf, usize),
+        /// An empty session: nothing is lost, so no question is asked.
+        Discard(PathBuf),
+    }
+    let mut click: Option<Click> = None;
+    let state = &mut app.quarantine;
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for s in &sessions {
-                let expanded = app.quarantine.expanded.as_ref() == Some(&s.journal_path);
+            for s in &state.sessions {
+                let expanded = state.expanded.as_ref() == Some(&s.journal_path);
+                let journal = || s.journal_path.clone();
                 ui.horizontal(|ui| {
-                    if ui.small_button(if expanded { "▼" } else { "▶" }).clicked() {
-                        toggle_expand = Some(s.journal_path.clone());
+                    if theme::disclosure(ui, expanded, false).clicked() {
+                        click = Some(Click::Expand(journal()));
                     }
                     ui.monospace(&s.name);
-                    if s.undone && s.files == 0 {
-                        ui.weak("wiederhergestellt, leer");
+                    if s.entries == 0 && s.files == 0 {
+                        ui.weak(if s.purged > 0 {
+                            "geleert"
+                        } else {
+                            "wiederhergestellt, leer"
+                        });
+                        if ui.small_button("Entfernen").clicked() {
+                            click = Some(Click::Discard(journal()));
+                        }
                     } else {
                         ui.label(format!(
                             "{} Einträge, {} Dateien, {}",
@@ -141,10 +242,10 @@ pub fn show(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                             ui.weak(format!("{} gelöscht", s.purged));
                         }
                         if s.entries > 0 && ui.button("Alles wiederherstellen").clicked() {
-                            restore_session = Some(s.journal_path.clone());
+                            click = Some(Click::RestoreSession(journal()));
                         }
                         if theme::danger_button(ui, "Endgültig löschen …").clicked() {
-                            app.quarantine.confirm = Some(Purge::Session(s.journal_path.clone()));
+                            state.confirm = Some(Purge::Session(journal()));
                         }
                     }
                     if ui.small_button("Anzeigen").clicked() {
@@ -152,14 +253,13 @@ pub fn show(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                     }
                 });
                 if expanded {
-                    let entries = app.quarantine.entries.clone();
-                    if entries.is_empty() {
+                    if state.entries.is_empty() {
                         ui.horizontal(|ui| {
                             ui.add_space(24.0);
                             ui.weak("keine Einträge mehr im Journal");
                         });
                     }
-                    for (i, e) in entries.iter().enumerate() {
+                    for (i, e) in state.entries.iter().enumerate() {
                         ui.horizontal(|ui| {
                             ui.add_space(24.0);
                             ui.label(if e.is_dir { "Ordner" } else { "Datei" });
@@ -173,11 +273,10 @@ pub fn show(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
                                 .truncate(),
                             );
                             if ui.small_button("Wiederherstellen").clicked() {
-                                restore_entry = Some((s.journal_path.clone(), i));
+                                click = Some(Click::RestoreEntry(journal(), i));
                             }
                             if theme::danger_button(ui, "Löschen").clicked() {
-                                app.quarantine.confirm =
-                                    Some(Purge::Entry(s.journal_path.clone(), i));
+                                state.confirm = Some(Purge::Entry(journal(), i));
                             }
                         });
                     }
@@ -186,133 +285,78 @@ pub fn show(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
             }
         });
 
-    if let Some(j) = toggle_expand {
-        if app.quarantine.expanded.as_ref() == Some(&j) {
-            app.quarantine.expanded = None;
-            app.quarantine.entries.clear();
-        } else {
-            app.quarantine.entries = actions::Journal::load(&j)
-                .map(|j| j.entries)
-                .unwrap_or_default();
-            app.quarantine.expanded = Some(j);
+    match click {
+        Some(Click::Expand(j)) => {
+            if state.expanded.as_ref() == Some(&j) {
+                state.expanded = None;
+                state.entries.clear();
+            } else {
+                state.entries = actions::Journal::load(&j)
+                    .map(|j| j.entries)
+                    .unwrap_or_default();
+                state.expanded = Some(j);
+            }
         }
-    }
-    if let Some(j) = restore_session {
-        let msg = match actions::undo(&j) {
-            Ok(r) => format!(
-                "{} Einträge wiederhergestellt, {} Konflikte.",
-                r.restored,
-                r.conflicts.len()
-            ),
-            Err(e) => format!("Wiederherstellen fehlgeschlagen: {e:#}"),
-        };
-        after_change(app, msg);
-    }
-    if let Some((j, i)) = restore_entry {
-        let msg = match actions::undo_entry(&j, i) {
-            Ok(()) => "Eintrag wiederhergestellt.".to_string(),
-            Err(e) => format!("Wiederherstellen fehlgeschlagen: {e:#}"),
-        };
-        after_change(app, msg);
+        Some(Click::RestoreSession(j)) => restore_session(app, j),
+        Some(Click::RestoreEntry(j, i)) => restore_entry(app, j, i),
+        Some(Click::Discard(j)) => purge(app, Purge::Session(j)),
+        None => {}
     }
     confirm_modal(app, ctx);
 }
 
 fn confirm_modal(app: &mut App, ctx: &egui::Context) {
-    let Some(purge) = app.quarantine.confirm.clone() else {
+    let Some(what) = app.quarantine.confirm.clone() else {
         return;
     };
-    let (title, detail) = match &purge {
-        Purge::Session(j) => {
-            let s = app
-                .quarantine
+    let state = &app.quarantine;
+    let (title, detail) = match &what {
+        Purge::Session(j) => (
+            "Sitzung endgültig löschen?",
+            state
                 .sessions
                 .iter()
-                .find(|s| &s.journal_path == j);
-            (
-                "Sitzung endgültig löschen?".to_string(),
-                s.map(|s| format!("{}: {} Dateien, {}", s.name, s.files, human(s.bytes)))
-                    .unwrap_or_default(),
-            )
-        }
+                .find(|s| &s.journal_path == j)
+                .map(|s| format!("{}: {} Dateien, {}", s.name, s.files, human(s.bytes)))
+                .unwrap_or_default(),
+        ),
         Purge::Entry(_, i) => (
-            "Eintrag endgültig löschen?".to_string(),
-            app.quarantine
+            "Eintrag endgültig löschen?",
+            state
                 .entries
                 .get(*i)
                 .map(|e| e.from.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         ),
         Purge::All => (
-            "Alle Sitzungen endgültig löschen?".to_string(),
+            "Alle Sitzungen endgültig löschen?",
             format!(
                 "{} Sitzungen, {} insgesamt",
-                app.quarantine.sessions.len(),
-                human(app.quarantine.total_bytes())
+                state.sessions.len(),
+                human(state.total_bytes())
             ),
         ),
     };
-    let mut run = false;
-    let modal = egui::Modal::new(egui::Id::new("purge_confirm")).show(ctx, |ui| {
-        ui.set_width(440.0);
-        ui.heading(title);
-        ui.label(detail);
-        ui.colored_label(
-            egui::Color32::from_rgb(230, 110, 100),
-            "Das lässt sich nicht rückgängig machen. Die Dateien werden ohne Papierkorb gelöscht.",
-        );
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            if ui.button("Abbrechen").clicked() {
-                app.quarantine.confirm = None;
-            }
-            if ui.button("Ja, endgültig löschen").clicked() {
-                run = true;
-            }
-        });
-    });
-    if modal.should_close() {
-        app.quarantine.confirm = None;
-    }
-    if !run {
-        return;
-    }
-    app.quarantine.confirm = None;
-    let msg = match purge {
-        Purge::Session(j) => match actions::purge_session(&j) {
-            Ok(r) => format!(
-                "Sitzung gelöscht: {} Dateien, {} freigegeben.",
-                r.removed,
-                human(r.bytes)
-            ),
-            Err(e) => format!("Löschen fehlgeschlagen: {e:#}"),
+    let answer = theme::confirm(
+        ctx,
+        "purge_confirm",
+        title,
+        "Ja, endgültig löschen",
+        true,
+        |ui| {
+            ui.label(detail);
+            ui.colored_label(
+                theme::RED,
+                "Das lässt sich nicht rückgängig machen. Die Dateien werden ohne Papierkorb gelöscht.",
+            );
         },
-        Purge::Entry(j, i) => match actions::purge_entry(&j, i) {
-            Ok(r) => format!("Eintrag gelöscht, {} freigegeben.", human(r.bytes)),
-            Err(e) => format!("Löschen fehlgeschlagen: {e:#}"),
-        },
-        Purge::All => {
-            let mut n = 0;
-            let mut bytes = 0;
-            let mut errors = Vec::new();
-            for s in app.quarantine.sessions.clone() {
-                match actions::purge_session(&s.journal_path) {
-                    Ok(r) => {
-                        n += r.removed;
-                        bytes += r.bytes;
-                    }
-                    Err(e) => errors.push(format!("{}: {e:#}", s.name)),
-                }
-            }
-            let mut m = format!("{n} Dateien gelöscht, {} freigegeben.", human(bytes));
-            for e in errors {
-                m.push_str(&format!("\n{e}"));
-            }
-            m
+    );
+    match answer {
+        theme::Answer::Pending => {}
+        theme::Answer::Cancelled => app.quarantine.confirm = None,
+        theme::Answer::Confirmed => {
+            app.quarantine.confirm = None;
+            purge(app, what);
         }
-    };
-    app.quarantine.message = Some(msg);
-    app.quarantine.expanded = None;
-    app.quarantine.entries.clear();
-    app.quarantine.stale = true;
+    }
 }

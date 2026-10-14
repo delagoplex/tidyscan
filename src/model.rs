@@ -156,6 +156,10 @@ pub struct ScanResult {
     /// The walk was aborted; the tree is a partial view of the disk.
     #[serde(default)]
     pub cancelled: bool,
+    /// Quarantine folders of earlier scans that used a subfolder as their root. They
+    /// are skipped like the root's own, so their content shows up in no total.
+    #[serde(default)]
+    pub nested_quarantines: Vec<PathBuf>,
     pub duration: Duration,
 }
 

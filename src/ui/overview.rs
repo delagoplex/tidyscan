@@ -85,7 +85,7 @@ fn details(app: &mut App, result: &ScanResult, ui: &mut Ui) {
             });
             if !result.errors.is_empty() && id == 0 {
                 ui.colored_label(
-                    egui::Color32::from_rgb(220, 160, 60),
+                    theme::AMBER,
                     format!(
                         "{} Pfade konnten nicht gelesen werden.",
                         result.errors.len()

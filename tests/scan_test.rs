@@ -183,3 +183,18 @@ fn absurd_timestamps_do_not_panic() {
     let early = SystemTime::UNIX_EPOCH - Duration::from_secs(300_000_000);
     assert!(fmt_date(early).ends_with("1960"));
 }
+
+#[test]
+fn quarantines_of_subfolder_scans_are_recorded() {
+    let fx = Fixture::new();
+    fx.file(".tidyscan-quarantine/s1/own.txt", b"x");
+    fx.file("sub/.tidyscan-quarantine/s2/nested.txt", b"x");
+    fx.file("sub/keep.txt", b"x");
+    let r = scan_simple(&fx.root(), &ScanOptions::default()).unwrap();
+    assert_eq!(r.files.len(), 1, "no quarantine content in the tree");
+    assert_eq!(
+        r.nested_quarantines,
+        vec![fx.root().join("sub").join(".tidyscan-quarantine")],
+        "the root's own quarantine is not a nested one"
+    );
+}

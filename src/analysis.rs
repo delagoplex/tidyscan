@@ -187,20 +187,6 @@ pub fn largest_files(result: &ScanResult, n: usize) -> Vec<FileId> {
     ids
 }
 
-/// Extension statistics across the whole scan: (extension, files, bytes), by bytes descending.
-pub fn extension_stats(result: &ScanResult) -> Vec<(String, u64, u64)> {
-    let mut map: std::collections::HashMap<String, (u64, u64)> = Default::default();
-    for f in &result.files {
-        let e = f.extension().unwrap_or_else(|| "(keine)".into());
-        let entry = map.entry(e).or_default();
-        entry.0 += 1;
-        entry.1 += f.size;
-    }
-    let mut v: Vec<_> = map.into_iter().map(|(k, (c, b))| (k, c, b)).collect();
-    v.sort_by_key(|a| std::cmp::Reverse(a.2));
-    v
-}
-
 /// Thousands separator in German style: 1.234.567.
 pub fn fmt_count(n: u64) -> String {
     let s = n.to_string();

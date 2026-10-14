@@ -26,12 +26,23 @@ pub struct QuarantineState {
     pub stale: bool,
     /// Root the listing was loaded for. A different root means a different quarantine.
     loaded_for: Option<PathBuf>,
+    /// Quarantine folders below the root that belong to scans of subfolders:
+    /// (folder, files, bytes).
+    pub nested: Vec<(PathBuf, u64, u64)>,
     pub confirm: Option<Purge>,
     pub message: Option<String>,
 }
 
 impl QuarantineState {
-    pub fn refresh(&mut self, root: &Path) {
+    pub fn refresh(&mut self, root: &Path, nested: &[PathBuf]) {
+        self.nested = nested
+            .iter()
+            .filter(|p| p.is_dir())
+            .map(|p| {
+                let (files, bytes) = actions::dir_stats(p);
+                (p.clone(), files, bytes)
+            })
+            .collect();
         self.sessions = actions::list_journals(root)
             .iter()
             .filter_map(|j| actions::session_info(j))
@@ -148,8 +159,13 @@ pub fn show(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
         ui.label("Der Ordner im Feld links existiert nicht.");
         return;
     };
+    let nested: Vec<PathBuf> = app
+        .result
+        .as_ref()
+        .map(|r| r.nested_quarantines.clone())
+        .unwrap_or_default();
     if app.quarantine.stale || app.quarantine.loaded_for.as_deref() != Some(root.as_path()) {
-        app.quarantine.refresh(&root);
+        app.quarantine.refresh(&root, &nested);
     }
     let quarantine_dir = root.join(QUARANTINE_DIR_NAME);
 
@@ -161,7 +177,7 @@ pub fn show(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
             human(app.quarantine.total_bytes())
         ));
         if ui.small_button("Aktualisieren").clicked() {
-            app.quarantine.refresh(&root);
+            app.quarantine.refresh(&root, &nested);
         }
         if ui.small_button("Ordner anzeigen").clicked() {
             reveal(&quarantine_dir);
@@ -176,6 +192,7 @@ pub fn show(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
         ui.label(egui::RichText::new(m).small());
     }
     ui.separator();
+    nested_section(app, &root, ui);
 
     if app.quarantine.sessions.is_empty() {
         ui.label("Keine Quarantäne-Sitzungen für diesen Ordner.");
@@ -303,6 +320,42 @@ pub fn show(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
         None => {}
     }
     confirm_modal(app, ctx);
+}
+
+/// Quarantines that belong to scans of subfolders. They are managed from there; here
+/// they are only pointed out, because their content appears in no size of this scan.
+fn nested_section(app: &mut App, root: &Path, ui: &mut Ui) {
+    if app.quarantine.nested.is_empty() {
+        return;
+    }
+    let mut scan: Option<PathBuf> = None;
+    ui.label(
+        "Quarantänen aus Scans von Unterordnern (in keiner Größenangabe dieses Scans enthalten):",
+    );
+    for (dir, files, bytes) in &app.quarantine.nested {
+        let owner = dir.parent().unwrap_or(dir);
+        ui.horizontal(|ui| {
+            ui.add_space(24.0);
+            ui.add(
+                egui::Label::new(owner.strip_prefix(root).unwrap_or(owner).to_string_lossy())
+                    .truncate(),
+            );
+            ui.weak(format!("{files} Dateien, {}", human(*bytes)));
+            if ui.small_button("Diesen Ordner scannen").clicked() {
+                scan = Some(owner.to_path_buf());
+            }
+            if ui.small_button("Anzeigen").clicked() {
+                reveal(dir);
+            }
+        });
+    }
+    ui.separator();
+    if let Some(dir) = scan
+        && !app.scanning()
+    {
+        app.root_text = dir.to_string_lossy().into_owned();
+        app.start_scan();
+    }
 }
 
 fn confirm_modal(app: &mut App, ctx: &egui::Context) {

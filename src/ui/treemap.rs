@@ -1,5 +1,7 @@
 //! Squarified treemap of the selected folder, nested up to a chosen depth.
 
+use std::rc::Rc;
+
 use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
 
 use super::{App, theme};
@@ -17,13 +19,24 @@ pub enum Item {
     File(FileId),
 }
 
+/// One rectangle of the map: where, what, nesting depth, fill colour.
+type Tile = (Rect, Item, usize, Color32);
+
+/// A computed layout and what it was computed for. Laying out sorts every folder
+/// involved, which is too much to repeat on every frame of a large scan.
+struct Layout {
+    zoom: DirId,
+    depth: usize,
+    area: Rect,
+    tiles: Rc<Vec<Tile>>,
+}
+
 pub struct TreemapState {
     /// Folder shown as the whole area.
     pub zoom: DirId,
     /// Nesting depth, 1 = only direct children.
     pub depth: usize,
-    /// Rectangles drawn in the last frame, deepest last, for hit testing.
-    drawn: Vec<(Rect, Item, usize)>,
+    layout: Option<Layout>,
 }
 
 impl Default for TreemapState {
@@ -31,15 +44,38 @@ impl Default for TreemapState {
         Self {
             zoom: 0,
             depth: 3,
-            drawn: Vec::new(),
+            layout: None,
         }
     }
 }
 
 impl TreemapState {
+    /// Called for every new scan result.
     pub fn reset(&mut self) {
         self.zoom = 0;
-        self.drawn.clear();
+        self.layout = None;
+    }
+
+    /// Tiles for the current view, deepest last, reusing the previous layout while
+    /// neither the view nor the available area changed.
+    fn tiles(&mut self, result: &ScanResult, area: Rect) -> Rc<Vec<Tile>> {
+        if let Some(l) = &self.layout
+            && l.zoom == self.zoom
+            && l.depth == self.depth
+            && l.area == area
+        {
+            return l.tiles.clone();
+        }
+        let mut tiles = Vec::new();
+        layout_dir(result, self.zoom, area, 0, self.depth, None, &mut tiles);
+        let tiles = Rc::new(tiles);
+        self.layout = Some(Layout {
+            zoom: self.zoom,
+            depth: self.depth,
+            area,
+            tiles: tiles.clone(),
+        });
+        tiles
     }
 }
 
@@ -140,7 +176,7 @@ fn layout_dir(
     depth: usize,
     max_depth: usize,
     base: Option<Color32>,
-    out: &mut Vec<(Rect, Item, usize, Color32)>,
+    out: &mut Vec<Tile>,
 ) {
     let node = &result.dirs[dir];
     let mut items: Vec<(Item, f32)> = node
@@ -234,16 +270,7 @@ pub fn show(app: &mut App, result: &ScanResult, ui: &mut Ui) {
     let painter = ui.painter_at(area);
     painter.rect_filled(area, CornerRadius::same(6), Color32::from_rgb(13, 15, 19));
 
-    let mut drawn: Vec<(Rect, Item, usize, Color32)> = Vec::new();
-    layout_dir(
-        result,
-        app.treemap.zoom,
-        area.shrink(GAP),
-        0,
-        app.treemap.depth,
-        None,
-        &mut drawn,
-    );
+    let drawn = app.treemap.tiles(result, area.shrink(GAP));
 
     let pointer: Option<Pos2> = resp.hover_pos();
     let hovered = pointer.and_then(|p| {
@@ -254,7 +281,7 @@ pub fn show(app: &mut App, result: &ScanResult, ui: &mut Ui) {
             .map(|(_, item, _, _)| *item)
     });
 
-    for (r, item, _depth, color) in &drawn {
+    for (r, item, _depth, color) in drawn.iter() {
         let is_hover = Some(*item) == hovered;
         let is_sel = matches!(item, Item::Dir(d) if *d == app.selected_dir);
         let fill = if is_hover {
@@ -340,5 +367,4 @@ pub fn show(app: &mut App, result: &ScanResult, ui: &mut Ui) {
             app.tree.reveal(result, d);
         }
     }
-    app.treemap.drawn = drawn.into_iter().map(|(r, i, d, _)| (r, i, d)).collect();
 }

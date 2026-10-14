@@ -244,6 +244,9 @@ pub fn scan(
         if entry.client_state.skip {
             result.skipped += 1;
             result.dirs[parent].own_skipped += 1;
+            if parent != 0 && entry.file_type.is_dir() && entry.file_name == QUARANTINE_DIR_NAME {
+                result.nested_quarantines.push(path);
+            }
             continue;
         }
 

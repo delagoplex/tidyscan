@@ -6,12 +6,11 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 
-use crate::actions::{Action, ActionKind, Guard, Plan};
+use crate::actions::{Action, ActionKind, Plan};
 use crate::analysis::{CATEGORY_COUNT, Category, files_under};
 use crate::context::{DirContext, category_folder_name};
-use crate::model::{DirId, FileId, ScanResult};
+use crate::model::{DirId, FileId, ScanResult, local_datetime};
 use crate::scan::QUARANTINE_DIR_NAME;
 use crate::triage::{Candidate, Kind, Risk, is_junk_name};
 
@@ -125,11 +124,12 @@ fn is_shortcut(f: &crate::model::FileEntry) -> bool {
         .unwrap_or(false)
 }
 
-fn year_of(f: &crate::model::FileEntry) -> i32 {
+/// Year subfolder for a file; files without a usable date are collected separately
+/// instead of being filed under the current year.
+fn year_of(f: &crate::model::FileEntry) -> String {
     f.modified
-        .map(OffsetDateTime::from)
-        .unwrap_or_else(OffsetDateTime::now_utc)
-        .year()
+        .and_then(local_datetime)
+        .map_or("Ohne Datum".to_string(), |t| t.year().to_string())
 }
 
 /// Names of the top-level target folders per category: an existing folder in the root
@@ -167,7 +167,7 @@ impl Targets {
     ) -> Option<PathBuf> {
         let mut p = PathBuf::from(self.names[category as usize].as_ref()?);
         if opts.by_year {
-            p.push(year_of(f).to_string());
+            p.push(year_of(f));
         }
         Some(p)
     }
@@ -229,16 +229,8 @@ fn move_candidate(
     risk: Risk,
     reason: impl Into<String>,
 ) -> Candidate {
-    let f = &result.files[id];
     Candidate {
-        action: Action {
-            source: f.path.clone(),
-            is_dir: false,
-            size: f.size,
-            kind: ActionKind::MoveTo(target),
-            reason: kind.label().to_string(),
-            guard: Some(Guard::for_file(f)),
-        },
+        action: Action::move_file(&result.files[id], target, kind.label()),
         kind,
         risk,
         reason: reason.into(),
@@ -250,14 +242,10 @@ fn move_candidate(
 
 fn leftover_dir_candidate(result: &ScanResult, d: DirId) -> Candidate {
     Candidate {
-        action: Action {
-            source: result.dirs[d].path.clone(),
-            is_dir: true,
-            size: 0,
-            kind: ActionKind::Quarantine,
-            reason: Kind::LeftoverDir.label().to_string(),
-            guard: None,
-        },
+        action: Action::quarantine_empty_dir(
+            result.dirs[d].path.clone(),
+            Kind::LeftoverDir.label(),
+        ),
         kind: Kind::LeftoverDir,
         risk: Risk::Safe,
         reason: "Quellordner ist nach dem Verschieben leer".into(),

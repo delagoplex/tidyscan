@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
 use crossbeam_channel::{Receiver, unbounded};
 use eframe::egui;
 
-use crate::actions::{Action, ActionKind, Plan};
+use crate::actions::{Action, Plan};
 use crate::age::{AgeBasis, AtimeReport, OldFile};
 use crate::analysis::{self, CategorySizes, human};
 use crate::dupes::DupeGroup;
@@ -93,27 +93,20 @@ impl Selection {
     }
 }
 
+/// Quarantine a file as the scan saw it; a file changed since then is skipped at run time.
 pub fn file_action(result: &ScanResult, id: FileId, reason: &str) -> Action {
-    let f = &result.files[id];
-    Action {
-        source: f.path.clone(),
-        is_dir: false,
-        size: f.size,
-        kind: ActionKind::Quarantine,
-        reason: reason.to_string(),
-        guard: None,
-    }
+    Action::quarantine_file(&result.files[id], reason)
 }
 
-pub fn dir_action(result: &ScanResult, id: DirId, reason: &str) -> Action {
-    Action {
-        source: result.dirs[id].path.clone(),
-        is_dir: true,
-        size: 0,
-        kind: ActionKind::Quarantine,
-        reason: reason.to_string(),
-        guard: None,
-    }
+/// Quarantine a folder the scan found empty; it is skipped if it has content at run time.
+pub fn empty_dir_action(result: &ScanResult, id: DirId, reason: &str) -> Action {
+    Action::quarantine_empty_dir(result.dirs[id].path.clone(), reason)
+}
+
+/// Quarantine a folder with everything in it.
+pub fn tree_action(result: &ScanResult, id: DirId, reason: &str) -> Action {
+    let d = &result.dirs[id];
+    Action::quarantine_tree(d.path.clone(), d.total_size, reason)
 }
 
 pub struct App {
@@ -309,7 +302,12 @@ impl App {
                 Ok(r) => {
                     self.now = SystemTime::now();
                     self.status = format!(
-                        "{} Dateien, {} Ordner, {} in {:.1?}. {} Fehler, {} übersprungen.",
+                        "{}{} Dateien, {} Ordner, {} in {:.1?}. {} Fehler, {} übersprungen.",
+                        if r.cancelled {
+                            "Abgebrochen, das Ergebnis ist unvollständig. "
+                        } else {
+                            ""
+                        },
                         r.files.len(),
                         r.dirs.len(),
                         human(r.total_size()),
@@ -409,24 +407,7 @@ impl App {
     /// Execute a plan, report, and rescan. Shared by the Aufräumen and Automatik tabs.
     pub(crate) fn execute_plan(&mut self, plan: Plan) {
         let msg = match crate::actions::execute(&plan, false) {
-            Ok(rep) => {
-                let mut m = format!(
-                    "{} Einträge verschoben ({}), {} übersprungen.",
-                    rep.moved,
-                    human(rep.bytes),
-                    rep.failed.len()
-                );
-                for (p, e) in rep.failed.iter().take(15) {
-                    m.push_str(&format!("\n  {}: {e}", p.display()));
-                }
-                if rep.failed.len() > 15 {
-                    m.push_str(&format!("\n  … und {} weitere", rep.failed.len() - 15));
-                }
-                if let Some(j) = rep.journal_path {
-                    m.push_str(&format!("\nJournal: {}", j.display()));
-                }
-                m
-            }
+            Ok(rep) => rep.summary(15),
             Err(e) => format!("Ausführen fehlgeschlagen: {e:#}"),
         };
         self.selection.clear();

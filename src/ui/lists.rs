@@ -3,7 +3,7 @@
 use eframe::egui::{self, Ui};
 use egui_extras::{Column, TableBuilder};
 
-use super::{App, dir_action, file_action, reveal};
+use super::{App, empty_dir_action, file_action, reveal};
 use crate::age::AgeBasis;
 use crate::analysis::human;
 
@@ -259,7 +259,7 @@ pub fn show_empty(app: &mut App, ui: &mut Ui) {
         if ui.button("Alle markieren").clicked() {
             for &d in &app.empty_dirs {
                 app.selection
-                    .insert(dir_action(&result, d, "Leerer Ordner"));
+                    .insert(empty_dir_action(&result, d, "Leerer Ordner"));
             }
         }
         if ui.button("Markierung aufheben").clicked() {
@@ -268,7 +268,13 @@ pub fn show_empty(app: &mut App, ui: &mut Ui) {
             }
         }
     });
-    ui.weak("Ein Ordner gilt als leer, wenn er auf keiner Ebene Dateien enthält. Beim Aufräumen werden auch seine leeren Unterordner entfernt.");
+    ui.weak("Ein Ordner gilt als leer, wenn er auf keiner Ebene Dateien enthält. Ordner mit übersprungenen oder nicht lesbaren Inhalten zählen nicht dazu. Beim Aufräumen werden auch seine leeren Unterordner verschoben.");
+    if result.cancelled {
+        ui.colored_label(
+            super::theme::AMBER,
+            "Der Scan wurde abgebrochen, deshalb werden keine leeren Ordner gemeldet.",
+        );
+    }
 
     let half = (ui.available_height() * 0.5).max(120.0);
     egui::ScrollArea::vertical()
@@ -282,7 +288,7 @@ pub fn show_empty(app: &mut App, ui: &mut Ui) {
                     let mut checked = app.selection.contains(&node.path);
                     if ui.checkbox(&mut checked, "").changed() {
                         app.selection
-                            .toggle(dir_action(&result, d, "Leerer Ordner"));
+                            .toggle(empty_dir_action(&result, d, "Leerer Ordner"));
                     }
                     let extra = if node.total_dirs > 0 {
                         format!("  (+{} leere Unterordner)", node.total_dirs)

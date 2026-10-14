@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 
-use crate::actions::{self, Action, ActionKind, Plan};
+use crate::actions::{self, ActionKind, Plan};
 use crate::age::{self, AgeBasis};
 use crate::analysis::{self, Category, human};
 use crate::context;
@@ -66,6 +66,9 @@ impl ScanArgs {
             result.errors.len(),
             result.skipped
         );
+        if result.cancelled {
+            eprintln!("Der Scan wurde abgebrochen, das Ergebnis ist unvollständig.");
+        }
         Ok(result)
     }
 }
@@ -326,26 +329,7 @@ pub fn run(cli: Cli) -> anyhow::Result<Option<Option<PathBuf>>> {
             let mut plan = rules::apply_rules(&result, &compiled, now);
             plan.dedup();
             print_plan(&plan);
-            if plan.is_empty() {
-                return Ok(None);
-            }
-            if apply {
-                let report = actions::execute(&plan, false)?;
-                println!(
-                    "\n{} Einträge verschoben ({}), {} fehlgeschlagen.",
-                    report.moved,
-                    human(report.bytes),
-                    report.failed.len()
-                );
-                for (p, e) in &report.failed {
-                    println!("    FEHLER {}: {e}", p.display());
-                }
-                if let Some(j) = report.journal_path {
-                    println!("Rückgängig mit: tidyscan undo \"{}\"", j.display());
-                }
-            } else {
-                println!("\nVorschau. Mit --apply wird tatsächlich verschoben.");
-            }
+            finish_auto(&plan, apply)?;
         }
         Some(Command::Undo { journal, root }) => {
             let path = match (journal, root) {
@@ -624,10 +608,10 @@ fn print_plan(plan: &Plan) {
         plan.len(),
         human(plan.total_bytes())
     );
-    for (a, (_, dest)) in plan.actions.iter().zip(plan.preview()) {
-        let what = match &a.kind {
-            ActionKind::Quarantine => "Quarantäne".to_string(),
-            ActionKind::MoveTo(_) => format!("→ {}", dest.display()),
+    for a in &plan.actions {
+        let what = match plan.move_target(a) {
+            Some(dest) => format!("→ {}", dest.display()),
+            None => "Quarantäne".to_string(),
         };
         println!(
             "  [{}] {:>10}  {}  {}",
@@ -636,18 +620,6 @@ fn print_plan(plan: &Plan) {
             a.source.display(),
             what
         );
-    }
-}
-
-/// Helper for building plans from the GUI.
-pub fn quarantine_action(source: PathBuf, is_dir: bool, size: u64, reason: &str) -> Action {
-    Action {
-        source,
-        is_dir,
-        size,
-        kind: ActionKind::Quarantine,
-        reason: reason.to_string(),
-        guard: None,
     }
 }
 
@@ -747,16 +719,8 @@ fn finish_auto(plan: &Plan, apply: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     let report = actions::execute(plan, false)?;
-    println!(
-        "\n{} Einträge verschoben ({}), {} übersprungen.",
-        report.moved,
-        human(report.bytes),
-        report.failed.len()
-    );
-    for (p, e) in &report.failed {
-        println!("    ÜBERSPRUNGEN {}: {e}", p.display());
-    }
-    if let Some(j) = report.journal_path {
+    println!("\n{}", report.summary(usize::MAX));
+    if let Some(j) = &report.journal_path {
         println!("Rückgängig mit: tidyscan undo \"{}\"", j.display());
     }
     Ok(())

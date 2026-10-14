@@ -1,11 +1,15 @@
 mod common;
 
-use std::time::SystemTime;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::time::{Duration, SystemTime};
 
 use common::Fixture;
 use tidyscan::age::{AgeBasis, find_old};
-use tidyscan::analysis::{Category, age_histogram, category_sizes, largest_files};
-use tidyscan::scan::{ScanOptions, scan_simple};
+use tidyscan::analysis::{Category, age_histogram, category_sizes, fmt_date, largest_files};
+use tidyscan::dupes::empty_dirs;
+use tidyscan::model::local_datetime;
+use tidyscan::scan::{ScanOptions, scan, scan_simple};
 
 #[test]
 fn builds_tree_with_aggregated_totals() {
@@ -114,4 +118,68 @@ fn old_files_and_histogram() {
     assert_eq!(h[0].files, 1, "< 30 days");
     assert_eq!(h[3].files, 1, "1-2 years");
     assert_eq!(h[4].files, 1, "> 2 years");
+}
+
+#[test]
+fn filters_never_remove_the_scan_root() {
+    let fx = Fixture::new();
+    fx.file(".cfg/a.txt", b"1");
+    fx.file(".cfg/.verborgen", b"1");
+    let root = fx.root().join(".cfg");
+    let opts = ScanOptions {
+        skip_hidden: true,
+        exclude_globs: vec!["**/.cfg".into()],
+        ..Default::default()
+    };
+    let r = scan_simple(&root, &opts).unwrap();
+    assert_eq!(r.dirs[0].path, root, "the root node always exists");
+    assert_eq!(r.files.len(), 1);
+    assert_eq!(r.files[0].name(), "a.txt");
+    assert_eq!(
+        r.dirs[0].own_skipped, 1,
+        "the hidden file is counted as skipped"
+    );
+}
+
+#[test]
+fn cancelled_scan_is_flagged_and_vouches_for_nothing() {
+    let fx = Fixture::new();
+    fx.dir_("leer");
+    fx.file("voll/x", b"1");
+    let r = scan(
+        &fx.root(),
+        &ScanOptions::default(),
+        None,
+        Arc::new(AtomicBool::new(true)),
+    )
+    .unwrap();
+    assert!(r.cancelled);
+    assert_eq!(r.dirs.len(), 1, "only the root, nothing was walked");
+    assert!(r.dirs[0].incomplete);
+    assert!(empty_dirs(&r).is_empty());
+}
+
+#[test]
+fn depth_limit_marks_unread_folders_as_incomplete() {
+    let fx = Fixture::new();
+    fx.file("a/b/c.txt", b"1");
+    fx.dir_("wirklich-leer");
+    let opts = ScanOptions {
+        max_depth: Some(1),
+        ..Default::default()
+    };
+    let r = scan_simple(&fx.root(), &opts).unwrap();
+    let a = r.dirs.iter().find(|d| d.name() == "a").unwrap();
+    assert_eq!(a.total_files, 0, "its content was never read");
+    assert!(a.incomplete && !a.known_empty());
+    assert!(empty_dirs(&r).is_empty(), "unread is not empty");
+}
+
+#[test]
+fn absurd_timestamps_do_not_panic() {
+    let far = SystemTime::UNIX_EPOCH + Duration::from_secs(900_000_000_000);
+    assert!(local_datetime(far).is_none());
+    assert_eq!(fmt_date(far), "?");
+    let early = SystemTime::UNIX_EPOCH - Duration::from_secs(300_000_000);
+    assert!(fmt_date(early).ends_with("1960"));
 }

@@ -2,7 +2,7 @@
 
 use eframe::egui::{self, Ui};
 
-use super::{App, dir_action, file_action, reveal, theme, tree, treemap};
+use super::{App, file_action, reveal, theme, tree, tree_action, treemap};
 use crate::analysis::{self, AgeBucket, Category, human};
 use crate::model::{DirId, FileId, ScanResult};
 
@@ -71,9 +71,8 @@ fn details(app: &mut App, result: &ScanResult, ui: &mut Ui) {
                         "Ganzen Ordner in Quarantäne (Plan)"
                     };
                     if ui.small_button(label).clicked() {
-                        let mut a = dir_action(result, id, "Ganzer Ordner");
-                        a.size = d.total_size;
-                        app.selection.toggle(a);
+                        app.selection
+                            .toggle(tree_action(result, id, "Ganzer Ordner"));
                     }
                 }
             });

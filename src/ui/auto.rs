@@ -122,6 +122,9 @@ pub fn start(app: &mut App, mode: Mode) {
     let Some(result) = app.result.clone() else {
         return;
     };
+    if result.cancelled {
+        return;
+    }
     app.auto.reset_results();
     app.auto.mode = Some(mode);
 
@@ -271,14 +274,22 @@ pub fn show(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
         return;
     };
     let busy = app.auto.busy();
+    // A partial tree says nothing reliable about what is empty, loose or duplicated.
+    let usable = !result.cancelled;
+    if !usable {
+        ui.colored_label(
+            theme::AMBER,
+            "Der Scan wurde abgebrochen. Für die Automatik bitte vollständig scannen.",
+        );
+    }
 
     ui.horizontal_wrapped(|ui| {
-        ui.add_enabled_ui(!busy, |ui| {
+        ui.add_enabled_ui(!busy && usable, |ui| {
             if theme::primary_button(ui, "Quarantäne-Vorschlag berechnen").clicked() {
                 start(app, Mode::Quarantine);
             }
         });
-        ui.add_enabled_ui(!busy, |ui| {
+        ui.add_enabled_ui(!busy && usable, |ui| {
             if theme::primary_button(ui, "Sortier-Vorschlag berechnen").clicked() {
                 start(app, Mode::Organize);
             }

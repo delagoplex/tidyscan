@@ -4,7 +4,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{DirId, FileEntry, FileId, ScanResult};
+use crate::model::{DirId, FileEntry, FileId, ScanResult, local_datetime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(usize)]
@@ -214,13 +214,12 @@ pub fn fmt_count(n: u64) -> String {
     out
 }
 
-/// Date as dd.mm.yyyy in local time.
+/// Date as dd.mm.yyyy in local time, "?" for timestamps outside the calendar range.
 pub fn fmt_date(t: SystemTime) -> String {
-    let dt = time::OffsetDateTime::from(t);
-    let dt = time::UtcOffset::current_local_offset()
-        .map(|o| dt.to_offset(o))
-        .unwrap_or(dt);
-    format!("{:02}.{:02}.{}", dt.day(), dt.month() as u8, dt.year())
+    match local_datetime(t) {
+        Some(dt) => format!("{:02}.{:02}.{}", dt.day(), dt.month() as u8, dt.year()),
+        None => "?".into(),
+    }
 }
 
 pub fn human(bytes: u64) -> String {

@@ -1,9 +1,9 @@
 //! Parallel directory walk that builds a [`ScanResult`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
 use crossbeam_channel::Sender;
@@ -50,6 +50,8 @@ struct Meta {
     accessed: Option<SystemTime>,
     /// Set for entries we decided to skip after looking at metadata.
     skip: bool,
+    /// Metadata could not be read; the entry is reported as an error, not as a file.
+    unreadable: bool,
 }
 
 type Walk = WalkDirGeneric<((), Meta)>;
@@ -85,8 +87,18 @@ fn is_excluded_absolute(path: &Path) -> bool {
     EXCLUDED_ABSOLUTE.iter().any(|p| Path::new(p) == path)
 }
 
+fn new_dir(path: PathBuf, parent: Option<usize>, depth: usize) -> DirNode {
+    DirNode {
+        path,
+        parent,
+        depth: depth.min(u16::MAX as usize) as u16,
+        ..Default::default()
+    }
+}
+
 /// Walk `root` and build the arena tree. `progress` receives periodic updates,
-/// `cancel` aborts the walk and returns what was collected so far.
+/// `cancel` aborts the walk and returns what was collected so far, flagged as
+/// [`ScanResult::cancelled`].
 pub fn scan(
     root: &Path,
     opts: &ScanOptions,
@@ -102,22 +114,33 @@ pub fn scan(
     let globs = Arc::new(build_globset(&opts.exclude_globs)?);
     let skip_hidden = opts.skip_hidden;
     let cancel_walk = cancel.clone();
+    // Directories whose listing is known to be partial. Filled from the worker threads.
+    let partial: Arc<Mutex<HashSet<PathBuf>>> = Arc::default();
+    let partial_walk = partial.clone();
 
     let mut walk = Walk::new(&root)
         .follow_links(false)
-        .skip_hidden(skip_hidden)
+        // Hidden entries are filtered below so that they still count as skipped.
+        .skip_hidden(false)
         .sort(false)
-        .process_read_dir(move |_depth, _path, _state, children| {
+        .process_read_dir(move |depth, dir, _state, children| {
+            // `depth == None` is the call for the scan root itself: the user chose it,
+            // so no filter applies to it.
+            if depth.is_none() {
+                return;
+            }
             if cancel_walk.load(Ordering::Relaxed) {
                 children.clear();
                 return;
             }
+            let mut any_unreadable = children.iter().any(|c| c.is_err());
             for child in children.iter_mut().flatten() {
                 let path = child.path();
                 let name = child.file_name.to_string_lossy();
                 let excluded = DEFAULT_EXCLUDED_NAMES
                     .iter()
                     .any(|n| name.eq_ignore_ascii_case(n))
+                    || (skip_hidden && name.starts_with('.'))
                     || globs.is_match(&path)
                     || is_excluded_absolute(&path);
                 if excluded || child.file_type.is_symlink() {
@@ -137,14 +160,21 @@ pub fn scan(
                                 size: md.len(),
                                 modified: md.modified().ok(),
                                 accessed: md.accessed().ok(),
-                                skip: false,
+                                ..Default::default()
                             };
                         }
                     }
                     Err(_) => {
-                        // Keep the entry; the error surfaces when iterating.
+                        // Without metadata we know neither size nor kind. Treating it as
+                        // an empty file would make it a cleanup candidate.
+                        child.read_children = None;
+                        child.client_state.unreadable = true;
+                        any_unreadable = true;
                     }
                 }
+            }
+            if any_unreadable && let Ok(mut set) = partial_walk.lock() {
+                set.insert(dir.to_path_buf());
             }
         });
     if let Some(d) = opts.max_depth {
@@ -155,8 +185,14 @@ pub fn scan(
         root: root.clone(),
         ..Default::default()
     };
+    // The root node exists no matter what the walk yields, so `dirs[0]` is always valid.
+    result.dirs.push(new_dir(root.clone(), None, 0));
     let mut dir_index: HashMap<PathBuf, usize> = HashMap::new();
-    let mut prog = ScanProgress::default();
+    dir_index.insert(root.clone(), 0);
+    let mut prog = ScanProgress {
+        dirs: 1,
+        ..Default::default()
+    };
     let mut since_report = 0u32;
 
     for entry in walk {
@@ -166,59 +202,70 @@ pub fn scan(
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
+                let path = e.path().map(Path::to_path_buf).unwrap_or_default();
+                if let Some(&p) = path.parent().and_then(|p| dir_index.get(p)) {
+                    result.dirs[p].own_unread = true;
+                }
                 result.errors.push(ScanError {
-                    path: e.path().map(Path::to_path_buf).unwrap_or_default(),
+                    path,
                     message: e.to_string(),
                 });
                 continue;
             }
         };
-        if entry.client_state.skip {
-            result.skipped += 1;
-            continue;
-        }
         let path = entry.path();
-        let parent = if entry.depth == 0 {
-            None
-        } else {
-            match dir_index.get(entry.parent_path()) {
-                Some(&p) => Some(p),
-                None => {
-                    // Parent was skipped or errored; drop the entry.
-                    result.skipped += 1;
-                    continue;
-                }
-            }
-        };
-
-        if entry.file_type.is_dir() {
-            let id = result.dirs.len();
-            result.dirs.push(DirNode {
-                path: path.clone(),
-                parent,
-                depth: entry.depth as u16,
-                children: Vec::new(),
-                files: Vec::new(),
-                total_size: 0,
-                total_files: 0,
-                total_dirs: 0,
-                newest: None,
-            });
-            if let Some(p) = parent {
-                result.dirs[p].children.push(id);
-            }
+        if entry.depth == 0 {
             if let Some(rc) = &entry.read_children
                 && let Some(err) = rc.error()
             {
+                result.dirs[0].own_unread = true;
+                result.errors.push(ScanError {
+                    path,
+                    message: err.to_string(),
+                });
+            }
+            if opts.max_depth == Some(0) {
+                result.dirs[0].own_unread = true;
+            }
+            continue;
+        }
+        let Some(&parent) = dir_index.get(entry.parent_path()) else {
+            // Parent was skipped or errored; it already accounts for this entry.
+            continue;
+        };
+        if entry.client_state.unreadable {
+            result.dirs[parent].own_unread = true;
+            result.errors.push(ScanError {
+                path,
+                message: "Metadaten nicht lesbar".into(),
+            });
+            continue;
+        }
+        if entry.client_state.skip {
+            result.skipped += 1;
+            result.dirs[parent].own_skipped += 1;
+            continue;
+        }
+
+        if entry.file_type.is_dir() {
+            let id = result.dirs.len();
+            let mut node = new_dir(path.clone(), Some(parent), entry.depth);
+            // At the depth limit the directory is listed but never read.
+            node.own_unread = opts.max_depth == Some(entry.depth);
+            if let Some(rc) = &entry.read_children
+                && let Some(err) = rc.error()
+            {
+                node.own_unread = true;
                 result.errors.push(ScanError {
                     path: path.clone(),
                     message: err.to_string(),
                 });
             }
+            result.dirs.push(node);
+            result.dirs[parent].children.push(id);
             dir_index.insert(path, id);
             prog.dirs += 1;
         } else if entry.file_type.is_file() {
-            let Some(parent) = parent else { continue };
             let m = entry.client_state;
             let id = result.files.len();
             result.files.push(FileEntry {
@@ -232,7 +279,9 @@ pub fn scan(
             prog.files += 1;
             prog.bytes += m.size;
         } else {
+            // Sockets, devices and the like.
             result.skipped += 1;
+            result.dirs[parent].own_skipped += 1;
             continue;
         }
 
@@ -243,6 +292,14 @@ pub fn scan(
             since_report = 0;
             prog.current = entry.parent_path().to_path_buf();
             let _ = tx.send(prog.clone());
+        }
+    }
+    result.cancelled = cancel.load(Ordering::Relaxed);
+    if let Ok(set) = partial.lock() {
+        for p in set.iter() {
+            if let Some(&d) = dir_index.get(p) {
+                result.dirs[d].own_unread = true;
+            }
         }
     }
 

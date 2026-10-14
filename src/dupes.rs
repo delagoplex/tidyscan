@@ -153,14 +153,15 @@ pub fn find_duplicates(
 }
 
 /// Directories that contain no files at any depth (recursively empty).
-/// The scan root itself is never reported. Sorted by path.
+/// Folders with skipped or unread content are not reported: the scan cannot vouch for
+/// them. The scan root itself is never reported. Sorted by path.
 pub fn empty_dirs(result: &ScanResult) -> Vec<DirId> {
     let mut ids: Vec<DirId> = result
         .dirs
         .iter()
         .enumerate()
         .skip(1)
-        .filter(|(_, d)| d.total_files == 0)
+        .filter(|(_, d)| d.known_empty())
         .map(|(i, _)| i)
         .collect();
     ids.sort_by(|a, b| result.dirs[*a].path.cmp(&result.dirs[*b].path));
@@ -174,7 +175,7 @@ pub fn empty_dirs_toplevel(result: &ScanResult) -> Vec<DirId> {
         .filter(|&id| {
             result.dirs[id]
                 .parent
-                .map(|p| p == ScanResult::ROOT || result.dirs[p].total_files > 0)
+                .map(|p| p == ScanResult::ROOT || !result.dirs[p].known_empty())
                 .unwrap_or(true)
         })
         .collect()

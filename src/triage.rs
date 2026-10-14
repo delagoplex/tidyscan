@@ -10,7 +10,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::actions::{Action, ActionKind, Guard, Plan};
+use crate::actions::{Action, Plan};
 use crate::analysis::Category;
 use crate::context::DirContext;
 use crate::dupes::{DupeGroup, empty_dirs_toplevel, zero_byte_files};
@@ -216,20 +216,14 @@ fn file_candidate(
     kind: Kind,
     risk: Risk,
     reason: impl Into<String>,
-    keep: Option<PathBuf>,
+    keep: Option<FileId>,
 ) -> Candidate {
-    let f = &result.files[id];
-    let mut guard = Guard::for_file(f);
-    guard.keep = keep;
+    let mut action = Action::quarantine_file(&result.files[id], kind.label());
+    if let Some(k) = keep {
+        action = action.keeping(&result.files[k]);
+    }
     Candidate {
-        action: Action {
-            source: f.path.clone(),
-            is_dir: false,
-            size: f.size,
-            kind: ActionKind::Quarantine,
-            reason: kind.label().to_string(),
-            guard: Some(guard),
-        },
+        action,
         kind,
         risk,
         reason: reason.into(),
@@ -247,14 +241,7 @@ fn dir_candidate(
     reason: impl Into<String>,
 ) -> Candidate {
     Candidate {
-        action: Action {
-            source: result.dirs[id].path.clone(),
-            is_dir: true,
-            size: 0,
-            kind: ActionKind::Quarantine,
-            reason: kind.label().to_string(),
-            guard: None,
-        },
+        action: Action::quarantine_empty_dir(result.dirs[id].path.clone(), kind.label()),
         kind,
         risk,
         reason: reason.into(),
@@ -570,7 +557,7 @@ pub fn assess(
                     },
                     risk,
                     reason,
-                    Some(keep_path.clone()),
+                    Some(keep),
                 );
                 c.hints.push(format!("behalten: {keep_rel}"));
                 taken.insert(id);

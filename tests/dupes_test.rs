@@ -93,3 +93,27 @@ fn zero_byte_files_are_listed() {
     let r = scan_simple(&fx.root(), &ScanOptions::default()).unwrap();
     assert_eq!(zero_byte_files(&r).len(), 2);
 }
+
+#[test]
+fn folders_with_skipped_content_are_not_empty() {
+    let fx = Fixture::new();
+    fx.file("repo/.git/config", b"x");
+    fx.file("versteckt/.secret", b"x");
+    fx.file("sub/.tidyscan-quarantine/s/alt.txt", b"x");
+    fx.dir_("wirklich-leer");
+
+    let opts = ScanOptions {
+        skip_hidden: true,
+        exclude_globs: vec!["**/.git".into()],
+        ..Default::default()
+    };
+    let r = scan_simple(&fx.root(), &opts).unwrap();
+    assert_eq!(r.files.len(), 0, "everything else was skipped");
+    let names: Vec<_> = empty_dirs_toplevel(&r)
+        .iter()
+        .map(|&i| r.dirs[i].name())
+        .collect();
+    assert_eq!(names, vec!["wirklich-leer"]);
+    let repo = r.dirs.iter().find(|d| d.name() == "repo").unwrap();
+    assert_eq!(repo.skipped, 1);
+}

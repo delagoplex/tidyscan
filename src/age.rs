@@ -63,7 +63,7 @@ pub fn atime_report(result: &ScanResult) -> AtimeReport {
             continue;
         };
         sampled += 1;
-        if a <= m + tolerance {
+        if m.checked_add(tolerance).is_none_or(|limit| a <= limit) {
             collapsed += 1;
         }
     }

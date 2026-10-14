@@ -20,11 +20,10 @@ use std::time::SystemTime;
 use anyhow::{Context, bail};
 use globset::{Glob, GlobMatcher};
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 
 use crate::actions::{Action, ActionKind, Guard, Plan};
 use crate::analysis::Category;
-use crate::model::{FileEntry, ScanResult};
+use crate::model::{FileEntry, ScanResult, local_datetime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -179,13 +178,14 @@ impl CompiledRule {
     /// Resolve `{year}`, `{month}`, `{ext}`, `{name}` in `move_to`.
     pub fn target_for(&self, file: &FileEntry) -> Option<PathBuf> {
         let template = self.rule.move_to.as_ref()?;
-        let ts = file
-            .modified
-            .map(OffsetDateTime::from)
-            .unwrap_or_else(OffsetDateTime::now_utc);
+        let ts = file.modified.and_then(local_datetime);
+        let year = ts.map_or("unbekannt".to_string(), |t| t.year().to_string());
+        let month = ts.map_or("unbekannt".to_string(), |t| {
+            format!("{:02}", t.month() as u8)
+        });
         let out = template
-            .replace("{year}", &ts.year().to_string())
-            .replace("{month}", &format!("{:02}", ts.month() as u8))
+            .replace("{year}", &year)
+            .replace("{month}", &month)
             .replace("{ext}", &file.extension().unwrap_or_default())
             .replace("{name}", &file.name());
         // Templates use forward slashes; rebuild from components so the result

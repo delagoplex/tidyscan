@@ -7,7 +7,6 @@ use eframe::egui::{self, Ui};
 use egui_extras::{Column, TableBuilder};
 
 use super::{App, theme};
-use crate::actions::ActionKind;
 use crate::analysis::human;
 use crate::rules;
 
@@ -61,7 +60,6 @@ fn plan_section(app: &mut App, ui: &mut Ui) {
         }
     });
 
-    let preview = plan.preview();
     let mut remove: Option<PathBuf> = None;
     TableBuilder::new(ui)
         .striped(true)
@@ -92,24 +90,19 @@ fn plan_section(app: &mut App, ui: &mut Ui) {
             body.rows(ROW, plan.len(), |mut row| {
                 let i = row.index();
                 let a = &plan.actions[i];
-                let (_, dest) = &preview[i];
                 row.col(|ui| {
                     ui.label(&a.reason);
                 });
                 row.col(|ui| {
-                    ui.label(if a.is_dir && a.size == 0 {
-                        "Ordner".into()
-                    } else {
-                        human(a.size)
-                    });
+                    ui.label(a.size_label());
                 });
                 row.col(|ui| {
                     ui.add(egui::Label::new(a.source.to_string_lossy()).truncate());
                 });
                 row.col(|ui| {
-                    let text = match &a.kind {
-                        ActionKind::Quarantine => "Quarantäne".to_string(),
-                        ActionKind::MoveTo(_) => dest.to_string_lossy().into_owned(),
+                    let text = match plan.move_target(a) {
+                        Some(dest) => dest.to_string_lossy().into_owned(),
+                        None => "Quarantäne".to_string(),
                     };
                     ui.add(egui::Label::new(text).truncate());
                 });

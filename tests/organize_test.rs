@@ -29,10 +29,38 @@ fn plan(
     fx: &Fixture,
     opts: &OrganizeOptions,
 ) -> (tidyscan::model::ScanResult, organize::OrganizePlan) {
-    let r = scan_simple(&fx.root(), &ScanOptions::default()).unwrap();
+    plan_at(&fx.root(), &ScanOptions::default(), opts)
+}
+
+fn plan_at(
+    root: &std::path::Path,
+    scan: &ScanOptions,
+    opts: &OrganizeOptions,
+) -> (tidyscan::model::ScanResult, organize::OrganizePlan) {
+    let r = scan_simple(root, scan).unwrap();
     let ctx = common::ctx(&r);
     let p = organize::plan_organize(&r, &ctx, opts, SystemTime::now());
     (r, p)
+}
+
+fn aged(fx: &Fixture, names: &[&str]) {
+    for name in names {
+        let p = fx.file(name, &[1u8; 100]);
+        fx.age(&p, 40);
+    }
+}
+
+fn verdict(
+    r: &tidyscan::model::ScanResult,
+    p: &organize::OrganizePlan,
+    name: &str,
+) -> FolderVerdict {
+    p.profiles
+        .iter()
+        .find(|f| r.dirs[f.dir].name() == name)
+        .unwrap_or_else(|| panic!("no profile for {name}"))
+        .verdict
+        .clone()
 }
 
 #[test]
@@ -73,12 +101,17 @@ fn loose_files_go_to_category_folders_with_companions() {
         ]
     );
     let unsure: Vec<String> = p.unsure.iter().map(|c| rel(c, &r.root)).collect();
-    assert!(unsure.contains(&"fresh.png".to_string()));
-    assert!(unsure.contains(&"notes.unknownext".to_string()));
-    assert!(unsure.contains(&"script.py".to_string()));
+    assert_eq!(unsure, vec!["fresh.png"], "shortcuts are never touched");
+    // Code and unknown types get no made-up target: they are listed, not planned.
+    let mut unsorted: Vec<String> = p.unsorted.iter().map(|&id| r.files[id].name()).collect();
+    unsorted.sort();
+    assert_eq!(unsorted, vec!["notes.unknownext", "script.py"]);
+    assert!(p.notes.iter().any(|n| n.contains("2 lose Dateien")));
     assert!(
-        !unsure.contains(&"link.lnk".to_string()),
-        "shortcuts are never touched"
+        p.safe
+            .iter()
+            .chain(&p.unsure)
+            .all(|c| !target(c).contains("Sonstiges"))
     );
     assert!(p.safe.iter().all(|c| c.action.guard.is_some()));
 
@@ -243,4 +276,178 @@ fn project_root_is_never_sorted() {
     let (_r, plan) = plan(&fx, &OrganizeOptions::default());
     assert!(plan.safe.is_empty() && plan.unsure.is_empty());
     assert_eq!(plan.notes.len(), 1);
+}
+
+#[test]
+fn downloads_as_scan_root_keeps_coherent_subfolders_together() {
+    let fx = Fixture::new();
+    aged(
+        &fx,
+        &[
+            "Downloads/lose.jpg",
+            "Downloads/Urlaub/a.jpg",
+            "Downloads/Urlaub/b.jpg",
+            "Downloads/Urlaub/c.jpg",
+        ],
+    );
+    let (r, p) = plan_at(
+        &fx.root().join("Downloads"),
+        &ScanOptions::default(),
+        &OrganizeOptions::default(),
+    );
+    assert_eq!(
+        verdict(&r, &p, "Urlaub"),
+        FolderVerdict::MoveWhole(Category::Image)
+    );
+    let moves: Vec<(String, String)> = p
+        .safe
+        .iter()
+        .filter(|c| !c.action.is_dir)
+        .map(|c| (rel(c, &r.root), target(c)))
+        .collect();
+    assert!(moves.contains(&("lose.jpg".into(), "Bilder".into())));
+    assert!(
+        moves.contains(&("Urlaub/a.jpg".into(), "Bilder/Urlaub".into())),
+        "the album moves as a unit instead of being emptied file by file: {moves:?}"
+    );
+}
+
+#[test]
+fn category_folder_as_scan_root_is_a_destination() {
+    let fx = Fixture::new();
+    aged(
+        &fx,
+        &[
+            "Pictures/a.jpg",
+            "Pictures/Urlaub/b.jpg",
+            "Pictures/Urlaub/c.jpg",
+            "Pictures/rechnung.pdf",
+            "Pictures/Belege/x.pdf",
+            "Pictures/Belege/y.pdf",
+        ],
+    );
+    let (r, p) = plan_at(
+        &fx.root().join("Pictures"),
+        &ScanOptions::default(),
+        &OrganizeOptions::default(),
+    );
+    assert!(
+        p.safe.is_empty(),
+        "nothing is moved on its own inside a category folder: {:?}",
+        p.safe.iter().map(|c| rel(c, &r.root)).collect::<Vec<_>>()
+    );
+    assert!(matches!(verdict(&r, &p, "Urlaub"), FolderVerdict::Keep(_)));
+    let mut unsure: Vec<String> = p.unsure.iter().map(|c| rel(c, &r.root)).collect();
+    unsure.sort();
+    assert_eq!(unsure, vec!["Belege/x.pdf", "Belege/y.pdf", "rechnung.pdf"]);
+    assert!(
+        p.unsure
+            .iter()
+            .all(|c| c.doubt == Some(tidyscan::triage::Doubt::Judgement))
+    );
+    assert!(p.notes.iter().any(|n| n.contains("Bilder-Ordner")));
+}
+
+#[test]
+fn folders_with_projects_or_unseen_content_are_not_taken_apart() {
+    let fx = Fixture::new();
+    aged(
+        &fx,
+        &[
+            "Album/a.jpg",
+            "Album/b.jpg",
+            "Album/c.jpg",
+            "Album/d.jpg",
+            "Album/e.jpg",
+            "Album/seite/logo.png",
+            "Reise/a.jpg",
+            "Reise/b.jpg",
+            "Reise/privat/c.jpg",
+        ],
+    );
+    fx.file("Album/seite/package.json", b"{}");
+    let scan = ScanOptions {
+        exclude_globs: vec!["**/privat".into()],
+        ..Default::default()
+    };
+    let (r, p) = plan_at(&fx.root(), &scan, &OrganizeOptions::default());
+
+    for name in ["Album", "Reise"] {
+        assert!(
+            matches!(verdict(&r, &p, name), FolderVerdict::Unsure(_)),
+            "{name}: {:?}",
+            verdict(&r, &p, name)
+        );
+    }
+    assert!(
+        p.safe.is_empty() && p.unsure.is_empty(),
+        "no candidate would split these folders: {:?}",
+        p.safe
+            .iter()
+            .chain(&p.unsure)
+            .map(|c| rel(c, &r.root))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn helper_files_travel_with_their_folder() {
+    let fx = Fixture::new();
+    aged(
+        &fx,
+        &[
+            "Urlaub/a.jpg",
+            "Urlaub/b.jpg",
+            "Urlaub/c.jpg",
+            "Urlaub/Thumbs.db",
+            "Urlaub/karte.lnk",
+            "Urlaub/.picasa.ini",
+        ],
+    );
+    let leer = fx.file("Urlaub/leer.txt", b"");
+    fx.age(&leer, 40);
+    let (r, p) = plan(&fx, &OrganizeOptions::default());
+
+    let files: Vec<&Candidate> = p.safe.iter().filter(|c| !c.action.is_dir).collect();
+    assert_eq!(files.len(), 7, "every file of the folder moves");
+    for c in &files {
+        assert_eq!(target(c), "Bilder/Urlaub", "{}", rel(c, &r.root));
+        assert!(matches!(c.kind, Kind::MoveFolder { .. }));
+    }
+    let dirs: Vec<&Candidate> = p.safe.iter().filter(|c| c.action.is_dir).collect();
+    assert_eq!(dirs.len(), 1);
+    assert!(
+        dirs[0].action.guard.as_ref().unwrap().expect_empty,
+        "the source folder only goes if it really is empty by then"
+    );
+}
+
+#[test]
+fn existing_category_folder_is_chosen_deterministically() {
+    for _ in 0..5 {
+        let fx = Fixture::new();
+        aged(
+            &fx,
+            &[
+                "lose.jpg",
+                "Bilder/x.jpg",
+                "Pictures/1.jpg",
+                "Pictures/2.jpg",
+                "Pictures/3.jpg",
+                "Fotos/a.jpg",
+                "Fotos/b.jpg",
+                "Fotos/c.jpg",
+                "Fotos/d.jpg",
+            ],
+        );
+        // The fullest candidate is a project and therefore no target.
+        fx.file("Fotos/package.json", b"{}");
+        let (r, p) = plan(&fx, &OrganizeOptions::default());
+        let lose = p
+            .safe
+            .iter()
+            .find(|c| rel(c, &r.root) == "lose.jpg")
+            .unwrap();
+        assert_eq!(target(lose), "Pictures");
+    }
 }

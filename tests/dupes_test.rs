@@ -117,3 +117,28 @@ fn folders_with_skipped_content_are_not_empty() {
     let repo = r.dirs.iter().find(|d| d.name() == "repo").unwrap();
     assert_eq!(repo.skipped, 1);
 }
+
+#[test]
+fn hard_links_are_one_file_not_duplicates() {
+    let fx = Fixture::new();
+    let data = vec![5u8; 4096];
+    let original = fx.file("a/original.bin", &data);
+    let link = fx.root().join("a/link.bin");
+    if std::fs::hard_link(&original, &link).is_err() {
+        return; // filesystem without hard links
+    }
+    let r = scan_simple(&fx.root(), &ScanOptions::default()).unwrap();
+    assert_eq!(r.files.len(), 2);
+    assert!(
+        find_duplicates(&r, 1, no_cancel(), None).is_empty(),
+        "two names for one file free nothing"
+    );
+
+    // A real copy next to them is a duplicate of the file, counted once.
+    fx.file("b/kopie.bin", &data);
+    let r = scan_simple(&fx.root(), &ScanOptions::default()).unwrap();
+    let groups = find_duplicates(&r, 1, no_cancel(), None);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].files.len(), 2);
+    assert_eq!(groups[0].wasted(), 4096);
+}

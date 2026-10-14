@@ -50,7 +50,7 @@ fn hash_prefix(path: &Path) -> io::Result<blake3::Hash> {
     Ok(blake3::hash(&buf[..read]))
 }
 
-fn hash_full(path: &Path) -> io::Result<blake3::Hash> {
+pub(crate) fn hash_full(path: &Path) -> io::Result<blake3::Hash> {
     let mut f = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; 1 << 20];
@@ -64,8 +64,43 @@ fn hash_full(path: &Path) -> io::Result<blake3::Hash> {
     Ok(hasher.finalize())
 }
 
+/// What identifies a file on disk regardless of its name: (volume, file number).
+/// `None` when it cannot be determined.
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(path).ok()?;
+    Some((md.dev(), md.ino()))
+}
+
+#[cfg(windows)]
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    let handle = winapi_util::Handle::from_path_any(path).ok()?;
+    let info = winapi_util::file::information(&handle).ok()?;
+    Some((info.volume_serial_number(), info.file_index()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// Drop further names of a file that is already in the list. Hard links are one file
+/// under several names, not copies: moving one away frees nothing.
+fn without_hard_links(result: &ScanResult, files: Vec<FileId>) -> Vec<FileId> {
+    let mut seen = std::collections::HashSet::new();
+    files
+        .into_iter()
+        .filter(|&id| match file_identity(&result.files[id].path) {
+            Some(identity) => seen.insert(identity),
+            None => true,
+        })
+        .collect()
+}
+
 /// Find byte-identical files of at least `min_size` bytes. Files that cannot be read
-/// are silently dropped from their group. Sorted by wasted bytes, descending.
+/// are silently dropped from their group, as are additional hard links to a file
+/// already in it. Sorted by wasted bytes, descending.
 pub fn find_duplicates(
     result: &ScanResult,
     min_size: u64,
@@ -139,9 +174,10 @@ pub fn find_duplicates(
             DupeGroup {
                 size,
                 hash: hash.to_hex().to_string(),
-                files,
+                files: without_hard_links(result, files),
             }
         })
+        .filter(|g| g.files.len() > 1)
         .collect();
 
     groups.sort_by(|a, b| {

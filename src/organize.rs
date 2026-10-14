@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use crate::actions::{Action, ActionKind, Plan};
 use crate::analysis::{CATEGORY_COUNT, Category, files_under};
 use crate::context::{DirContext, category_folder_name};
-use crate::model::{DirId, FileId, ScanResult, local_datetime};
+use crate::model::{DirId, FileEntry, FileId, ScanResult, local_datetime};
 use crate::scan::QUARANTINE_DIR_NAME;
-use crate::triage::{Candidate, Kind, Risk, is_junk_name};
+use crate::triage::{Candidate, Doubt, Kind, Risk, is_junk_name, plan_from};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrganizeOptions {
@@ -45,6 +45,19 @@ pub enum FolderVerdict {
     Unsure(String),
 }
 
+impl FolderVerdict {
+    /// One line for listings.
+    pub fn describe(&self) -> String {
+        match self {
+            FolderVerdict::Keep(why) if why.is_empty() => "bleibt".into(),
+            FolderVerdict::Keep(why) => format!("bleibt ({why})"),
+            FolderVerdict::MoveWhole(c) => format!("wird als Ganzes nach {} verschoben", c.label()),
+            FolderVerdict::Distribute => "gemischt, Verteilung vorgeschlagen (unsicher)".into(),
+            FolderVerdict::Unsure(why) => format!("unsicher ({why})"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FolderProfile {
     pub dir: DirId,
@@ -54,6 +67,22 @@ pub struct FolderProfile {
     pub share: f32,
     pub composition: String,
     pub verdict: FolderVerdict,
+}
+
+impl FolderProfile {
+    /// A folder that is left exactly as it is, with the reason why.
+    fn kept(result: &ScanResult, dir: DirId, why: impl Into<String>) -> Self {
+        let node = &result.dirs[dir];
+        Self {
+            dir,
+            files: node.total_files,
+            bytes: node.total_size,
+            dominant: Category::Other,
+            share: 0.0,
+            composition: String::new(),
+            verdict: FolderVerdict::Keep(why.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,31 +123,28 @@ pub struct OrganizePlan {
     pub profiles: Vec<FolderProfile>,
     pub after: AfterTree,
     pub notes: Vec<String>,
+    /// Loose files without a category that could be sorted (code, unknown types).
+    /// They stay where they are; there is no made-up target folder for them.
+    #[serde(default)]
+    pub unsorted: Vec<FileId>,
 }
 
 impl OrganizePlan {
-    pub fn safe_bytes(&self) -> u64 {
-        self.safe.iter().map(Candidate::size).sum()
+    pub fn to_plan(&self, root: &Path, include_unsure: bool) -> Plan {
+        plan_from(root, &self.safe, &self.unsure, include_unsure)
     }
 
-    pub fn to_plan(&self, root: &Path, include_unsure: bool) -> Plan {
-        let mut plan = Plan::new(root);
-        for c in &self.safe {
-            plan.push(c.action.clone());
+    fn push(&mut self, c: Candidate) {
+        match c.risk {
+            Risk::Safe => self.safe.push(c),
+            _ => self.unsure.push(c),
         }
-        if include_unsure {
-            for c in &self.unsure {
-                plan.push(c.action.clone());
-            }
-        }
-        plan.dedup();
-        plan
     }
 }
 
 const SHORTCUT_EXT: &[&str] = &["lnk", "url", "desktop", "webloc"];
 
-fn is_shortcut(f: &crate::model::FileEntry) -> bool {
+fn is_shortcut(f: &FileEntry) -> bool {
     f.extension()
         .map(|e| SHORTCUT_EXT.contains(&e.as_str()))
         .unwrap_or(false)
@@ -126,7 +152,7 @@ fn is_shortcut(f: &crate::model::FileEntry) -> bool {
 
 /// Year subfolder for a file; files without a usable date are collected separately
 /// instead of being filed under the current year.
-fn year_of(f: &crate::model::FileEntry) -> String {
+fn year_of(f: &FileEntry) -> String {
     f.modified
         .and_then(local_datetime)
         .map_or("Ohne Datum".to_string(), |t| t.year().to_string())
@@ -145,13 +171,28 @@ impl Targets {
         for c in Category::ALL {
             names[c as usize] = category_folder_name(c).map(String::from);
         }
-        if let Some(root) = result.dirs.first() {
-            for &d in &root.children {
-                if let Some(c) = ctx.category_folder[d]
-                    && category_folder_name(c).is_some()
-                {
-                    names[c as usize] = Some(result.dirs[d].name());
-                }
+        // With several candidates ("Bilder" and "Pictures") the fuller one wins, then
+        // the alphabetically first: the order of a parallel scan must not decide.
+        let mut best: [Option<(u64, String)>; CATEGORY_COUNT] = Default::default();
+        for &d in &result.dirs[0].children {
+            let Some(c) = ctx.category_folder[d] else {
+                continue;
+            };
+            if category_folder_name(c).is_none() || !ctx.is_touchable(d) {
+                continue;
+            }
+            let found = (result.dirs[d].total_files, result.dirs[d].name());
+            let better = match &best[c as usize] {
+                None => true,
+                Some((files, name)) => found.0 > *files || (found.0 == *files && found.1 < *name),
+            };
+            if better {
+                best[c as usize] = Some(found);
+            }
+        }
+        for (slot, found) in names.iter_mut().zip(best) {
+            if let Some((_, name)) = found {
+                *slot = Some(name);
             }
         }
         Self { names }
@@ -159,12 +200,7 @@ impl Targets {
 
     /// Target directory (relative to the root) for a file of `category`, or `None`
     /// when the category is never sorted automatically.
-    fn dir(
-        &self,
-        category: Category,
-        f: &crate::model::FileEntry,
-        opts: &OrganizeOptions,
-    ) -> Option<PathBuf> {
+    fn dir(&self, category: Category, f: &FileEntry, opts: &OrganizeOptions) -> Option<PathBuf> {
         let mut p = PathBuf::from(self.names[category as usize].as_ref()?);
         if opts.by_year {
             p.push(year_of(f));
@@ -173,8 +209,9 @@ impl Targets {
     }
 }
 
-/// Files the sorter never moves on its own: junk, empty files, shortcuts, dotfiles.
-fn ignorable(f: &crate::model::FileEntry) -> bool {
+/// Files that say nothing about what a folder is and are never sorted on their own:
+/// junk, empty files, shortcuts, dotfiles.
+fn ignorable(f: &FileEntry) -> bool {
     let name = f.name();
     f.size == 0 || is_junk_name(&name) || is_shortcut(f) || name.starts_with('.')
 }
@@ -221,38 +258,35 @@ fn group_category(result: &ScanResult, group: &[FileId]) -> Option<Category> {
         .map(Category::of_file)
 }
 
+/// A file move into `target`: safe without a doubt, unsure with one.
 fn move_candidate(
     result: &ScanResult,
     id: FileId,
     target: PathBuf,
     kind: Kind,
-    risk: Risk,
+    doubt: Option<Doubt>,
     reason: impl Into<String>,
 ) -> Candidate {
-    Candidate {
-        action: Action::move_file(&result.files[id], target, kind.label()),
-        kind,
-        risk,
-        reason: reason.into(),
-        hints: Vec::new(),
-        file: Some(id),
-        dir: None,
-    }
+    let action = Action::move_file(&result.files[id], target, kind.label());
+    let mut c = match doubt {
+        None => Candidate::safe(action, kind, reason),
+        Some(d) => Candidate::unsure(action, kind, d, reason),
+    };
+    c.file = Some(id);
+    c
 }
 
 fn leftover_dir_candidate(result: &ScanResult, d: DirId) -> Candidate {
-    Candidate {
-        action: Action::quarantine_empty_dir(
-            result.dirs[d].path.clone(),
-            Kind::LeftoverDir.label(),
-        ),
-        kind: Kind::LeftoverDir,
-        risk: Risk::Safe,
-        reason: "Quellordner ist nach dem Verschieben leer".into(),
-        hints: Vec::new(),
-        file: None,
-        dir: Some(d),
-    }
+    // Guarded: if a file stayed behind after all, the folder is left where it is.
+    let action =
+        Action::quarantine_empty_dir(result.dirs[d].path.clone(), Kind::LeftoverDir.label());
+    let mut c = Candidate::safe(
+        action,
+        Kind::LeftoverDir,
+        "Quellordner ist nach dem Verschieben leer",
+    );
+    c.dir = Some(d);
+    c
 }
 
 fn composition(result: &ScanResult, files: &[FileId]) -> (Vec<(Category, u64, u64)>, u64, u64) {
@@ -286,6 +320,26 @@ fn recent(result: &ScanResult, id: FileId, opts: &OrganizeOptions, now: SystemTi
         .is_none_or(|a| a < opts.min_age_days)
 }
 
+/// Why the folder `d` cannot be taken apart file by file: something inside would be
+/// left behind (content the scan did not see) or pulled out of its context (a project).
+fn whole_move_obstacle(result: &ScanResult, ctx: &DirContext, d: DirId) -> Option<&'static str> {
+    let node = &result.dirs[d];
+    if node.skipped > 0 || node.incomplete {
+        return Some("enthält Einträge, die der Scan nicht erfasst hat");
+    }
+    let mut stack = node.children.clone();
+    while let Some(sd) = stack.pop() {
+        if ctx.project[sd] {
+            return Some("enthält ein Projekt");
+        }
+        if ctx.protected[sd] {
+            return Some("enthält einen geschützten Ordner");
+        }
+        stack.extend(result.dirs[sd].children.iter().copied());
+    }
+    None
+}
+
 pub fn plan_organize(
     result: &ScanResult,
     ctx: &DirContext,
@@ -300,18 +354,49 @@ pub fn plan_organize(
         plan.notes.push("Der gescannte Ordner liegt in einem geschützten Bereich. Sortieren ist hier nicht sinnvoll.".into());
         return plan;
     }
-    if ctx.project[0] {
+    if result.cancelled {
         plan.notes.push(
-            "Der gescannte Ordner ist ein Projekt. Projektdateien werden nicht umsortiert.".into(),
+            "Der Scan wurde abgebrochen. Aus einem unvollständigen Ergebnis wird kein Vorschlag abgeleitet."
+                .into(),
         );
+        return plan;
+    }
+    if ctx.project[0] {
+        plan.notes.push(match &ctx.enclosing_project {
+            Some(p) => format!(
+                "Der gescannte Ordner gehört zum Projekt {}. Projektdateien werden nicht umsortiert.",
+                p.display()
+            ),
+            None => {
+                "Der gescannte Ordner ist ein Projekt. Projektdateien werden nicht umsortiert."
+                    .into()
+            }
+        });
         return plan;
     }
 
     let targets = Targets::new(result, ctx);
+    // A scan root that is itself a category folder ("Bilder") is a destination, not a
+    // mess: what matches stays, everything else is only pointed out.
+    let root_category = ctx.category_folder[0];
+    if let Some(c) = root_category {
+        plan.notes.push(format!(
+            "Der gescannte Ordner ist selbst ein {}-Ordner. Passendes bleibt liegen, anderes wird nur als Vorschlag gezeigt.",
+            c.label()
+        ));
+    }
 
     // 1. Loose files directly in the root.
     let root_files: Vec<FileId> = result.dirs[0].files.clone();
-    sort_loose_files(result, &root_files, &targets, opts, now, &mut plan, "");
+    sort_loose_files(
+        result,
+        &root_files,
+        &targets,
+        opts,
+        now,
+        &mut plan,
+        root_category,
+    );
 
     // 2. Subfolders, top-down. Children are only visited when the parent is left alone.
     let mut stack: Vec<DirId> = result.dirs[0].children.clone();
@@ -319,10 +404,7 @@ pub fn plan_organize(
     while let Some(d) = stack.pop() {
         let node = &result.dirs[d];
         let name = node.name();
-        let rel = result
-            .relative(&node.path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = result.relative_slashed(&node.path);
 
         let keep = if ctx.protected[d] {
             Some("geschützter Bereich")
@@ -336,42 +418,20 @@ pub fn plan_organize(
             None
         };
         if let Some(why) = keep {
-            plan.profiles.push(FolderProfile {
-                dir: d,
-                files: node.total_files,
-                bytes: node.total_size,
-                dominant: Category::Other,
-                share: 0.0,
-                composition: String::new(),
-                verdict: FolderVerdict::Keep(why.into()),
-            });
+            plan.profiles.push(FolderProfile::kept(result, d, why));
             continue;
         }
 
         // A downloads folder is a dumping ground: its direct files count as loose,
         // its subfolders are judged on their own.
         if ctx.downloads_root[d] && ctx.category_folder[d].is_none() {
-            sort_loose_files(
-                result,
-                &node.files,
-                &targets,
-                opts,
-                now,
-                &mut plan,
-                &format!(" (in {rel})"),
-            );
+            sort_loose_files(result, &node.files, &targets, opts, now, &mut plan, None);
             stack.extend(node.children.iter().copied());
-            plan.profiles.push(FolderProfile {
-                dir: d,
-                files: node.total_files,
-                bytes: node.total_size,
-                dominant: Category::Other,
-                share: 0.0,
-                composition: String::new(),
-                verdict: FolderVerdict::Keep(
-                    "Downloads: Dateien werden einzeln einsortiert".into(),
-                ),
-            });
+            plan.profiles.push(FolderProfile::kept(
+                result,
+                d,
+                "Downloads: Dateien werden einzeln einsortiert",
+            ));
             continue;
         }
 
@@ -390,7 +450,7 @@ pub fn plan_organize(
                         id,
                         t,
                         Kind::Sort { category: fc },
-                        Risk::Unsure,
+                        Some(Doubt::Judgement),
                         format!(
                             "{} in einem {}-Ordner, passt nicht dazu",
                             fc.label(),
@@ -399,35 +459,31 @@ pub fn plan_organize(
                     ));
                 }
             }
-            plan.profiles.push(FolderProfile {
-                dir: d,
-                files: node.total_files,
-                bytes: node.total_size,
-                dominant: cat,
-                share: 1.0,
-                composition: String::new(),
-                verdict: FolderVerdict::Keep(format!("Kategorie-Ordner für {}", cat.label())),
-            });
+            let mut profile =
+                FolderProfile::kept(result, d, format!("Kategorie-Ordner für {}", cat.label()));
+            profile.dominant = cat;
+            profile.share = 1.0;
+            plan.profiles.push(profile);
             continue;
         }
 
-        let all_raw = files_under(result, d);
-        let (junk, all): (Vec<FileId>, Vec<FileId>) = all_raw
+        let obstacle = whole_move_obstacle(result, ctx, d);
+        let everything = files_under(result, d);
+        // What the folder is about is judged without helper files.
+        let telling: Vec<FileId> = everything
             .iter()
-            .partition(|&&id| ignorable(&result.files[id]));
-        if all.is_empty() {
-            plan.profiles.push(FolderProfile {
-                dir: d,
-                files: node.total_files,
-                bytes: node.total_size,
-                dominant: Category::Other,
-                share: 0.0,
-                composition: String::new(),
-                verdict: FolderVerdict::Keep("nur Hilfs- oder Leerdateien".into()),
-            });
+            .copied()
+            .filter(|&id| !ignorable(&result.files[id]))
+            .collect();
+        if telling.is_empty() {
+            plan.profiles.push(FolderProfile::kept(
+                result,
+                d,
+                "nur Hilfs- oder Leerdateien",
+            ));
             continue;
         }
-        let (comp, n_files, n_bytes) = composition(result, &all);
+        let (comp, n_files, n_bytes) = composition(result, &telling);
         let (dominant, dom_files, dom_bytes) = comp[0];
         let share_files = dom_files as f32 / n_files.max(1) as f32;
         let share_bytes = dom_bytes as f32 / n_bytes.max(1) as f32;
@@ -441,6 +497,13 @@ pub fn plan_organize(
             composition: describe(&comp),
             verdict: FolderVerdict::Keep(String::new()),
         };
+        // Taking a folder apart leaves unseen content behind and tears projects out of
+        // their surroundings, so such a folder is neither moved nor distributed.
+        if let Some(why) = obstacle {
+            profile.verdict = FolderVerdict::Unsure(format!("{why}, bleibt unangetastet"));
+            plan.profiles.push(profile);
+            continue;
+        }
 
         if coherent {
             let Some(folder) = targets.names[dominant as usize].clone() else {
@@ -456,33 +519,48 @@ pub fn plan_organize(
             }
             // Move the folder as a unit: Root/<Kategorie>/<Ordnername>/<Unterstruktur>.
             let base = PathBuf::from(folder).join(&name);
-            let has_recent = all.iter().any(|&id| recent(result, id, opts, now));
+            let has_recent = everything.iter().any(|&id| recent(result, id, opts, now));
             let portable = dominant == Category::Installer && !ctx.downloads[d];
-            let risk = if has_recent || portable {
-                Risk::Unsure
-            } else {
-                Risk::Safe
-            };
-            let reason = if portable {
-                format!(
-                    "{} ({rel}): ausführbare Dateien außerhalb von Downloads könnten ein portables Programm sein",
-                    profile.composition
+            let (doubt, reason) = if portable {
+                (
+                    Some(Doubt::Judgement),
+                    format!(
+                        "{} ({rel}): ausführbare Dateien außerhalb von Downloads könnten ein portables Programm sein",
+                        profile.composition
+                    ),
+                )
+            } else if let Some(c) = root_category {
+                (
+                    Some(Doubt::Judgement),
+                    format!(
+                        "{} ({rel}) in einem {}-Ordner, passt nicht dazu",
+                        profile.composition,
+                        c.label()
+                    ),
                 )
             } else if has_recent {
-                format!(
-                    "{} ({rel}), enthält innerhalb des letzten Tages geänderte Dateien",
-                    profile.composition
+                (
+                    Some(Doubt::Recent),
+                    format!(
+                        "{} ({rel}), enthält innerhalb des letzten Tages geänderte Dateien",
+                        profile.composition
+                    ),
                 )
             } else {
-                format!("zusammenhängender Ordner: {}", profile.composition)
+                (
+                    None,
+                    format!("zusammenhängender Ordner: {}", profile.composition),
+                )
             };
-            for &id in &all {
+            // Helper files (shortcuts, dotfiles, thumbnails) travel with their folder.
+            for &id in &everything {
                 let f = &result.files[id];
                 let inner = f
                     .path
                     .parent()
                     .and_then(|p| p.strip_prefix(&node.path).ok())
                     .unwrap_or(Path::new(""));
+                // Joining an empty path would leave a trailing separator behind.
                 let target = if inner.as_os_str().is_empty() {
                     base.clone()
                 } else {
@@ -493,31 +571,14 @@ pub fn plan_organize(
                     id,
                     target,
                     Kind::MoveFolder { category: dominant },
-                    risk,
+                    doubt,
                     reason.clone(),
                 );
                 c.dir = Some(d);
-                push(&mut plan, c);
-            }
-            // Junk inside a moved folder goes to quarantine so the source ends up empty.
-            if risk == Risk::Safe {
-                for &id in &junk {
-                    let mut c = move_candidate(
-                        result,
-                        id,
-                        PathBuf::new(),
-                        Kind::Junk,
-                        Risk::Safe,
-                        "Hilfsdatei im verschobenen Ordner",
-                    );
-                    c.action.kind = ActionKind::Quarantine;
-                    c.action.reason = Kind::Junk.label().to_string();
-                    c.dir = Some(d);
-                    plan.safe.push(c);
-                }
+                plan.push(c);
             }
             // Source folder and its subfolders are empty afterwards: quarantine them, deepest first.
-            if risk == Risk::Safe {
+            if doubt.is_none() {
                 let mut dirs = vec![d];
                 let mut i = 0;
                 while i < dirs.len() {
@@ -534,9 +595,9 @@ pub fn plan_organize(
         }
 
         // Mixed folder: offer distribution, but only as an unsure suggestion.
-        let too_many = all.len() > opts.max_distribute_files;
+        let too_many = telling.len() > opts.max_distribute_files;
         let reason = format!("gemischter Ordner {rel}: {}", profile.composition);
-        for group in companion_groups(result, &all) {
+        for group in companion_groups(result, &telling) {
             let Some(cat) = group_category(result, &group) else {
                 continue;
             };
@@ -550,14 +611,14 @@ pub fn plan_organize(
                     id,
                     t,
                     Kind::Distribute,
-                    Risk::Unsure,
+                    Some(Doubt::Judgement),
                     reason.clone(),
                 );
                 c.dir = Some(d);
                 if too_many {
                     c.hints.push(format!(
                         "{} Dateien, zu viele für eine automatische Verteilung",
-                        all.len()
+                        telling.len()
                     ));
                 }
                 plan.unsure.push(c);
@@ -571,17 +632,18 @@ pub fn plan_organize(
         plan.profiles.push(profile);
     }
 
-    plan.after = after_tree(result, ctx, &plan);
+    if !plan.unsorted.is_empty() {
+        plan.notes.push(format!(
+            "{} lose Dateien ohne passende Kategorie (Code, unbekannte Typen) bleiben, wo sie sind.",
+            plan.unsorted.len()
+        ));
+    }
+    plan.after = after_tree(result, &plan);
     plan
 }
 
-fn push(plan: &mut OrganizePlan, c: Candidate) {
-    match c.risk {
-        Risk::Safe => plan.safe.push(c),
-        _ => plan.unsure.push(c),
-    }
-}
-
+/// Sort files lying loose in one folder. `home` is the category that folder itself
+/// stands for, if any: matching files are already where they belong.
 fn sort_loose_files(
     result: &ScanResult,
     files: &[FileId],
@@ -589,7 +651,7 @@ fn sort_loose_files(
     opts: &OrganizeOptions,
     now: SystemTime,
     plan: &mut OrganizePlan,
-    where_: &str,
+    home: Option<Category>,
 ) {
     let files: Vec<FileId> = files
         .iter()
@@ -597,40 +659,39 @@ fn sort_loose_files(
         .filter(|&id| !ignorable(&result.files[id]))
         .collect();
     for group in companion_groups(result, &files) {
-        let cat = group_category(result, &group);
+        let Some(cat) = group_category(result, &group) else {
+            plan.unsorted.extend(group);
+            continue;
+        };
+        if home == Some(cat) {
+            continue;
+        }
         for &id in &group {
             let f = &result.files[id];
-            let Some(cat) = cat else {
-                let own = Category::of_file(f);
-                if matches!(own, Category::Code | Category::Other) {
-                    // Nothing sensible to do automatically; mention it once per file.
-                    let mut c = move_candidate(
-                        result,
-                        id,
-                        PathBuf::from("Sonstiges"),
-                        Kind::Sort { category: own },
-                        Risk::Unsure,
-                        format!(
-                            "Kategorie {}: keine automatische Zuordnung{}",
-                            own.label(),
-                            where_
-                        ),
-                    );
-                    c.hints.push("Ziel 'Sonstiges' nur als Vorschlag".into());
-                    plan.unsure.push(c);
-                }
-                continue;
-            };
             let Some(t) = targets.dir(cat, f, opts) else {
                 continue;
             };
-            let c = if recent(result, id, opts, now) {
+            let kind = Kind::Sort { category: cat };
+            let c = if let Some(h) = home {
                 move_candidate(
                     result,
                     id,
                     t,
-                    Kind::Sort { category: cat },
-                    Risk::Unsure,
+                    kind,
+                    Some(Doubt::Judgement),
+                    format!(
+                        "{} in einem {}-Ordner, passt nicht dazu",
+                        cat.label(),
+                        h.label()
+                    ),
+                )
+            } else if recent(result, id, opts, now) {
+                move_candidate(
+                    result,
+                    id,
+                    t,
+                    kind,
+                    Some(Doubt::Recent),
                     "innerhalb des letzten Tages geändert, vielleicht noch in Benutzung",
                 )
             } else {
@@ -638,24 +699,18 @@ fn sort_loose_files(
                     result,
                     id,
                     t,
-                    Kind::Sort { category: cat },
-                    Risk::Safe,
+                    kind,
+                    None,
                     format!("lose Datei, Kategorie {}", cat.label()),
                 )
             };
-            push(plan, c);
+            plan.push(c);
         }
     }
 }
 
 /// The resulting top-level structure if the safe actions were executed.
-fn after_tree(result: &ScanResult, _ctx: &DirContext, plan: &OrganizePlan) -> AfterTree {
-    let root = &result.root;
-    let rel_of = |p: &Path| -> String {
-        p.strip_prefix(root)
-            .map(|r| r.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|_| p.to_string_lossy().into_owned())
-    };
+fn after_tree(result: &ScanResult, plan: &OrganizePlan) -> AfterTree {
     let moved: HashMap<&Path, &Candidate> = plan
         .safe
         .iter()
@@ -687,15 +742,16 @@ fn after_tree(result: &ScanResult, _ctx: &DirContext, plan: &OrganizePlan) -> Af
             continue;
         }
         let all = files_under(result, d);
-        let staying: Vec<&crate::model::FileEntry> = all
+        let staying: Vec<&FileEntry> = all
             .iter()
             .map(|&id| &result.files[id])
             .filter(|f| !moved.contains_key(f.path.as_path()))
             .collect();
+        let rel = result.relative_slashed(&node.path);
         folders.insert(
-            rel_of(&node.path),
+            rel.clone(),
             AfterFolder {
-                rel: rel_of(&node.path),
+                rel,
                 staying_files: staying.len() as u64,
                 staying_bytes: staying.iter().map(|f| f.size).sum(),
                 incoming: Vec::new(),
@@ -707,29 +763,22 @@ fn after_tree(result: &ScanResult, _ctx: &DirContext, plan: &OrganizePlan) -> Af
         let ActionKind::MoveTo(t) = &c.action.kind else {
             continue;
         };
-        let top = t
-            .components()
+        let mut parts = t.components();
+        let top = parts
             .next()
             .map(|x| x.as_os_str().to_string_lossy().into_owned())
             .unwrap_or_default();
+        let below = parts
+            .as_path()
+            .join(c.action.source.file_name().unwrap_or_default());
         let entry = folders.entry(top.clone()).or_insert_with(|| AfterFolder {
             rel: top,
             ..Default::default()
         });
         entry.incoming.push(AfterFile {
-            name: t
-                .strip_prefix(
-                    t.components()
-                        .next()
-                        .map(|x| PathBuf::from(x.as_os_str()))
-                        .unwrap_or_default(),
-                )
-                .map(|rest| rest.join(c.action.source.file_name().unwrap_or_default()))
-                .unwrap_or_default()
-                .to_string_lossy()
-                .replace('\\', "/"),
+            name: below.to_string_lossy().replace('\\', "/"),
             size: c.action.size,
-            from: c.action.source.parent().map(rel_of),
+            from: c.action.source.parent().map(|p| result.relative_slashed(p)),
         });
     }
     for f in folders.values_mut() {

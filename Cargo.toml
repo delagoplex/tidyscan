@@ -33,6 +33,9 @@ thiserror = "2.0.21"
 time = { version = "0.3.55", features = ["formatting", "macros", "local-offset"] }
 toml = "1.1.8"
 
+[target.'cfg(windows)'.dependencies]
+winapi-util = "0.1.11"
+
 [dev-dependencies]
 filetime = "0.2.29"
 tempfile = "3.27.0"

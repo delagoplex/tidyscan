@@ -8,13 +8,13 @@ use std::time::SystemTime;
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 
-use crate::actions::{self, ActionKind, Plan};
+use crate::actions::{self, Plan};
 use crate::age::{self, AgeBasis};
 use crate::analysis::{self, Category, human};
 use crate::context;
 use crate::dupes;
 use crate::model::ScanResult;
-use crate::organize::{self, AfterTree, FolderVerdict, OrganizeOptions, OrganizePlan};
+use crate::organize::{self, AfterTree, OrganizeOptions, OrganizePlan};
 use crate::rules;
 use crate::scan::{self, ScanOptions};
 use crate::triage::{self, Candidate, Triage, TriageOptions};
@@ -634,19 +634,11 @@ fn print_candidates(title: &str, list: &[Candidate], result: &ScanResult) {
         println!("   {label}: {n} ({})", human(b));
     }
     for c in list {
-        let what = match &c.action.kind {
-            ActionKind::Quarantine => "Quarantäne".to_string(),
-            ActionKind::MoveTo(t) => format!("→ {}", t.display()),
-        };
         println!(
             "  {:>10}  {}  {}",
-            if c.action.is_dir {
-                "Ordner".into()
-            } else {
-                human(c.size())
-            },
+            c.action.size_label(),
             result.relative(&c.action.source).display(),
-            what
+            c.action.target_label()
         );
         println!("              {}", c.reason);
         for h in &c.hints {
@@ -661,13 +653,7 @@ fn print_profiles(p: &OrganizePlan, result: &ScanResult) {
     }
     println!("\n== Unterordner");
     for f in &p.profiles {
-        let verdict = match &f.verdict {
-            FolderVerdict::Keep(why) if why.is_empty() => "bleibt".to_string(),
-            FolderVerdict::Keep(why) => format!("bleibt ({why})"),
-            FolderVerdict::MoveWhole(c) => format!("wird als Ganzes nach {} verschoben", c.label()),
-            FolderVerdict::Distribute => "gemischt, Verteilung vorgeschlagen (unsicher)".into(),
-            FolderVerdict::Unsure(why) => format!("unsicher ({why})"),
-        };
+        let verdict = f.verdict.describe();
         println!(
             "  {:<32} {:>6} Dateien {:>10}  {}",
             result.relative(&result.dirs[f.dir].path).display(),

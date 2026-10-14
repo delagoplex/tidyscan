@@ -2,6 +2,7 @@
 //!
 //! Every candidate is either *safe* (moved without asking), *unsure* (shown with a
 //! reason, the user decides or asks for a re-check) or *protected* (never touched).
+//! A re-check can additionally *block* a candidate that must not be touched right now.
 
 use std::collections::HashSet;
 use std::fs;
@@ -13,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::actions::{Action, Plan};
 use crate::analysis::Category;
 use crate::context::DirContext;
-use crate::dupes::{DupeGroup, empty_dirs_toplevel, zero_byte_files};
+use crate::dupes::{DupeGroup, empty_dirs_toplevel, hash_full, zero_byte_files};
 use crate::model::{DirId, FileEntry, FileId, ScanResult, age_days};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +22,23 @@ pub enum Risk {
     Safe,
     Unsure,
     Protected,
+    /// A re-check found a reason not to touch it now (in use, changed since the scan).
+    /// Never part of a plan, whatever the user ticks.
+    Blocked,
+}
+
+/// Why a candidate is unsure. This, not the wording of the reason, decides what a
+/// re-check may conclude.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Doubt {
+    /// Changed recently and may still be in use. Settled by an in-use test.
+    Recent,
+    /// Belongs to a software project. Only the user can tell.
+    Project,
+    /// A question of intent (portable program or installer?). Only the user can tell.
+    Judgement,
+    /// Can be confirmed on disk: identical content, an extracted folder, emptiness.
+    Verifiable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +93,9 @@ pub struct Candidate {
     pub action: Action,
     pub kind: Kind,
     pub risk: Risk,
+    /// Set for unsure candidates.
+    #[serde(default)]
+    pub doubt: Option<Doubt>,
     pub reason: String,
     pub hints: Vec<String>,
     pub file: Option<FileId>,
@@ -82,9 +103,51 @@ pub struct Candidate {
 }
 
 impl Candidate {
+    /// A candidate that is moved without asking.
+    pub fn safe(action: Action, kind: Kind, reason: impl Into<String>) -> Self {
+        Self {
+            action,
+            kind,
+            risk: Risk::Safe,
+            doubt: None,
+            reason: reason.into(),
+            hints: Vec::new(),
+            file: None,
+            dir: None,
+        }
+    }
+
+    /// A candidate the user has to decide on.
+    pub fn unsure(action: Action, kind: Kind, doubt: Doubt, reason: impl Into<String>) -> Self {
+        Self {
+            risk: Risk::Unsure,
+            doubt: Some(doubt),
+            ..Self::safe(action, kind, reason)
+        }
+    }
+
     pub fn size(&self) -> u64 {
         self.action.size
     }
+}
+
+/// Build a plan from the safe candidates and, on explicit request, the unsure ones.
+/// Blocked candidates never make it into a plan.
+pub fn plan_from(
+    root: &Path,
+    safe: &[Candidate],
+    unsure: &[Candidate],
+    include_unsure: bool,
+) -> Plan {
+    let mut plan = Plan::new(root);
+    let unsure = if include_unsure { unsure } else { &[] };
+    for c in safe.iter().chain(unsure) {
+        if matches!(c.risk, Risk::Safe | Risk::Unsure) {
+            plan.push(c.action.clone());
+        }
+    }
+    plan.dedup();
+    plan
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -97,35 +160,17 @@ pub struct Triage {
 }
 
 impl Triage {
-    pub fn safe_bytes(&self) -> u64 {
-        self.safe.iter().map(Candidate::size).sum()
-    }
-
-    pub fn unsure_bytes(&self) -> u64 {
-        self.unsure.iter().map(Candidate::size).sum()
-    }
-
     fn push(&mut self, c: Candidate) {
         match c.risk {
             Risk::Safe => self.safe.push(c),
-            Risk::Unsure => self.unsure.push(c),
+            Risk::Unsure | Risk::Blocked => self.unsure.push(c),
             Risk::Protected => self.protected += 1,
         }
     }
 
     /// Build a plan from the safe candidates (and optionally the unsure ones).
     pub fn to_plan(&self, root: &Path, include_unsure: bool) -> Plan {
-        let mut plan = Plan::new(root);
-        for c in &self.safe {
-            plan.push(c.action.clone());
-        }
-        if include_unsure {
-            for c in &self.unsure {
-                plan.push(c.action.clone());
-            }
-        }
-        plan.dedup();
-        plan
+        plan_from(root, &self.safe, &self.unsure, include_unsure)
     }
 
     /// Candidates grouped by kind label, in a stable order: (label, count, bytes).
@@ -185,6 +230,15 @@ const JUNK_NAMES: &[&str] = &["thumbs.db", "ehthumbs.db", ".ds_store", ".localiz
 const ZERO_BYTE_KEEP: &[&str] = &[".gitkeep", ".keep", "__init__.py", ".nomedia"];
 const ZERO_BYTE_KEEP_EXT: &[&str] = &["lock", "pid"];
 
+/// Extension of an (already lowercased) file name. A name without a dot has none:
+/// a file called `download` or `temp` is not a partial download or a temp file.
+fn extension_of(lower: &str) -> &str {
+    Path::new(lower)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+}
+
 /// True for names the sorter must ignore (temp files, locks, partial downloads).
 pub fn is_junk_name(name: &str) -> bool {
     junk_kind(name, &TriageOptions::default()).is_some()
@@ -199,8 +253,7 @@ fn junk_kind(name: &str, opts: &TriageOptions) -> Option<(Kind, u64)> {
     if lower.starts_with("~$") || (lower.starts_with(".~lock.") && lower.ends_with('#')) {
         return Some((Kind::OfficeLock, opts.lock_min_age_days));
     }
-    let ext = lower.rsplit('.').next().unwrap_or("");
-    match ext {
+    match extension_of(&lower) {
         "tmp" | "temp" => Some((Kind::Junk, opts.junk_min_age_days)),
         "dmp" => Some((Kind::Junk, 30)),
         "crdownload" | "part" | "partial" | "download" | "!ut" => {
@@ -210,45 +263,39 @@ fn junk_kind(name: &str, opts: &TriageOptions) -> Option<(Kind, u64)> {
     }
 }
 
-fn file_candidate(
-    result: &ScanResult,
-    id: FileId,
-    kind: Kind,
-    risk: Risk,
-    reason: impl Into<String>,
-    keep: Option<FileId>,
-) -> Candidate {
-    let mut action = Action::quarantine_file(&result.files[id], kind.label());
-    if let Some(k) = keep {
-        action = action.keeping(&result.files[k]);
-    }
-    Candidate {
-        action,
-        kind,
-        risk,
-        reason: reason.into(),
-        hints: Vec::new(),
-        file: Some(id),
-        dir: None,
+/// How sure we are about one candidate while it is being assessed.
+enum Verdict {
+    Safe(String),
+    Unsure(Doubt, String),
+}
+
+fn safe(reason: impl Into<String>) -> Verdict {
+    Verdict::Safe(reason.into())
+}
+
+fn unsure(doubt: Doubt, reason: impl Into<String>) -> Verdict {
+    Verdict::Unsure(doubt, reason.into())
+}
+
+fn candidate(action: Action, kind: Kind, verdict: Verdict) -> Candidate {
+    match verdict {
+        Verdict::Safe(reason) => Candidate::safe(action, kind, reason),
+        Verdict::Unsure(doubt, reason) => Candidate::unsure(action, kind, doubt, reason),
     }
 }
 
-fn dir_candidate(
-    result: &ScanResult,
-    id: DirId,
-    kind: Kind,
-    risk: Risk,
-    reason: impl Into<String>,
-) -> Candidate {
-    Candidate {
-        action: Action::quarantine_empty_dir(result.dirs[id].path.clone(), kind.label()),
-        kind,
-        risk,
-        reason: reason.into(),
-        hints: Vec::new(),
-        file: None,
-        dir: Some(id),
-    }
+fn file_candidate(result: &ScanResult, id: FileId, kind: Kind, verdict: Verdict) -> Candidate {
+    let action = Action::quarantine_file(&result.files[id], kind.label());
+    let mut c = candidate(action, kind, verdict);
+    c.file = Some(id);
+    c
+}
+
+fn dir_candidate(result: &ScanResult, id: DirId, kind: Kind, verdict: Verdict) -> Candidate {
+    let action = Action::quarantine_empty_dir(result.dirs[id].path.clone(), kind.label());
+    let mut c = candidate(action, kind, verdict);
+    c.dir = Some(id);
+    c
 }
 
 fn project_hint(result: &ScanResult, ctx: &DirContext, dir: DirId) -> String {
@@ -257,7 +304,10 @@ fn project_hint(result: &ScanResult, ctx: &DirContext, dir: DirId) -> String {
             "liegt im Projekt {}",
             result.relative(&result.dirs[p].path).display()
         ),
-        None => "liegt in einem Projektordner".into(),
+        None => match &ctx.enclosing_project {
+            Some(p) => format!("liegt im Projekt {}", p.display()),
+            None => "liegt in einem Projektordner".into(),
+        },
     }
 }
 
@@ -307,6 +357,13 @@ pub fn assess(
         );
         return t;
     }
+    if result.cancelled {
+        t.notes.push(
+            "Der Scan wurde abgebrochen. Aus einem unvollständigen Ergebnis wird kein Vorschlag abgeleitet."
+                .into(),
+        );
+        return t;
+    }
     let mut taken: HashSet<FileId> = HashSet::new();
 
     // 1. Junk, locks, partial downloads, installers, archives: one pass over all files.
@@ -320,29 +377,20 @@ pub fn assess(
                 t.protected += 1;
                 continue;
             }
-            let c = if ctx.project[parent] {
-                let hint = project_hint(result, ctx, parent);
-                file_candidate(result, id, kind, Risk::Unsure, hint, None)
+            let verdict = if ctx.project[parent] {
+                unsure(Doubt::Project, project_hint(result, ctx, parent))
             } else if age.is_some_and(|a| a >= min_age) {
-                file_candidate(
-                    result,
-                    id,
-                    kind.clone(),
-                    Risk::Safe,
-                    kind_reason(&kind),
-                    None,
+                safe(kind_reason(&kind))
+            } else if kind == Kind::OfficeLock {
+                unsure(
+                    Doubt::Recent,
+                    "jünger als ein Tag, die Datei ist vielleicht gerade geöffnet",
                 )
             } else {
-                let why = match kind {
-                    Kind::OfficeLock => {
-                        "jünger als ein Tag, die Datei ist vielleicht gerade geöffnet".to_string()
-                    }
-                    _ => format!("jünger als {min_age} Tage"),
-                };
-                file_candidate(result, id, kind, Risk::Unsure, why, None)
+                unsure(Doubt::Recent, format!("jünger als {min_age} Tage"))
             };
             taken.insert(id);
-            t.push(c);
+            t.push(file_candidate(result, id, kind, verdict));
             continue;
         }
 
@@ -358,27 +406,25 @@ pub fn assess(
                 if ctx.protected[parent] || ctx.project[parent] {
                     continue; // installers inside projects/tools are build artefacts, leave them
                 }
-                let c = if ctx.downloads[parent] {
-                    file_candidate(
-                        result,
-                        id,
-                        Kind::OldInstaller,
-                        Risk::Safe,
-                        format!("Installer in Downloads, seit {a} Tagen unverändert"),
-                        None,
+                // Only a file lying loose in Downloads is clearly a leftover installer.
+                // One level down it may be part of an unpacked program.
+                let verdict = if ctx.downloads_root[parent] {
+                    safe(format!(
+                        "Installer in Downloads, seit {a} Tagen unverändert"
+                    ))
+                } else if ctx.downloads[parent] {
+                    unsure(
+                        Doubt::Judgement,
+                        "liegt in einem Unterordner von Downloads und könnte zu einem entpackten Programm gehören",
                     )
                 } else {
-                    file_candidate(
-                        result,
-                        id,
-                        Kind::OldInstaller,
-                        Risk::Unsure,
+                    unsure(
+                        Doubt::Judgement,
                         "liegt außerhalb von Downloads und könnte eine portable Anwendung sein",
-                        None,
                     )
                 };
                 taken.insert(id);
-                t.push(c);
+                t.push(file_candidate(result, id, Kind::OldInstaller, verdict));
             }
             Category::Archive => {
                 if ctx.protected[parent] || ctx.project[parent] || !ctx.downloads[parent] {
@@ -389,29 +435,25 @@ pub fn assess(
                         result,
                         id,
                         Kind::ExtractedArchive,
-                        Risk::Safe,
-                        format!(
+                        safe(format!(
                             "bereits entpackt nach {} ({} Dateien)",
                             result.relative(&result.dirs[d].path).display(),
                             result.dirs[d].total_files
-                        ),
-                        None,
+                        )),
                     );
                     c.dir = Some(d);
                     taken.insert(id);
                     t.push(c);
-                } else if age.is_some_and(|a| a >= opts.archive_unsure_age_days) {
+                } else if let Some(a) = age.filter(|&a| a >= opts.archive_unsure_age_days) {
                     taken.insert(id);
                     t.push(file_candidate(
                         result,
                         id,
                         Kind::OldArchive,
-                        Risk::Unsure,
-                        format!(
-                            "seit {} Tagen in Downloads, kein entpackter Ordner gefunden",
-                            age.unwrap_or(0)
+                        unsure(
+                            Doubt::Verifiable,
+                            format!("seit {a} Tagen in Downloads, kein entpackter Ordner gefunden"),
                         ),
-                        None,
                     ));
                 }
             }
@@ -432,54 +474,30 @@ pub fn assess(
             continue;
         }
         let keep_name = ZERO_BYTE_KEEP.contains(&lower.as_str())
-            || ZERO_BYTE_KEEP_EXT
-                .iter()
-                .any(|e| lower.rsplit('.').next() == Some(e));
-        let c = if ctx.project[f.parent] {
-            file_candidate(
-                result,
-                id,
-                Kind::ZeroByte,
-                Risk::Unsure,
-                project_hint(result, ctx, f.parent),
-                None,
-            )
+            || ZERO_BYTE_KEEP_EXT.contains(&extension_of(&lower));
+        let verdict = if ctx.project[f.parent] {
+            unsure(Doubt::Project, project_hint(result, ctx, f.parent))
         } else if keep_name || name.starts_with('.') {
-            file_candidate(
-                result,
-                id,
-                Kind::ZeroByte,
-                Risk::Unsure,
+            unsure(
+                Doubt::Judgement,
                 "Platzhalter- oder Sperrdatei, die Programme absichtlich leer anlegen",
-                None,
             )
         } else if f
             .age_days(now)
             .is_some_and(|a| a >= opts.zero_byte_min_age_days)
         {
-            file_candidate(
-                result,
-                id,
-                Kind::ZeroByte,
-                Risk::Safe,
-                "leere Datei, seit über einer Woche unverändert",
-                None,
-            )
+            safe("leere Datei, seit über einer Woche unverändert")
         } else {
-            file_candidate(
-                result,
-                id,
-                Kind::ZeroByte,
-                Risk::Unsure,
+            unsure(
+                Doubt::Recent,
                 format!(
                     "jünger als {} Tage, wird vielleicht noch geschrieben",
                     opts.zero_byte_min_age_days
                 ),
-                None,
             )
         };
         taken.insert(id);
-        t.push(c);
+        t.push(file_candidate(result, id, Kind::ZeroByte, verdict));
     }
 
     // 3. Duplicates.
@@ -506,11 +524,10 @@ pub fn assess(
             if members.len() < 2 {
                 continue;
             }
-            let in_project: Vec<FileId> = members
+            let in_project = members
                 .iter()
                 .copied()
-                .filter(|&id| ctx.project[result.files[id].parent])
-                .collect();
+                .find(|&id| ctx.project[result.files[id].parent]);
             let recent = members.iter().any(|&id| {
                 result.files[id]
                     .age_days(now)
@@ -532,33 +549,26 @@ pub fn assess(
             let keep_rel = result.relative(&keep_path).display().to_string();
 
             for &id in order.iter().skip(1) {
-                let (risk, reason) = if !in_project.is_empty() {
-                    let d = result.files[in_project[0]].parent;
-                    (
-                        Risk::Unsure,
+                let verdict = if let Some(p) = in_project {
+                    let d = result.files[p].parent;
+                    unsure(
+                        Doubt::Project,
                         format!("eine Kopie {}", project_hint(result, ctx, d)),
                     )
                 } else if recent {
-                    (
-                        Risk::Unsure,
-                        "eine Kopie wurde innerhalb des letzten Tages geändert".to_string(),
+                    unsure(
+                        Doubt::Verifiable,
+                        "eine Kopie wurde innerhalb des letzten Tages geändert",
                     )
                 } else {
-                    (
-                        Risk::Safe,
-                        format!("identisch mit {keep_rel}, die bleibt erhalten"),
-                    )
+                    safe(format!("identisch mit {keep_rel}, die bleibt erhalten"))
                 };
-                let mut c = file_candidate(
-                    result,
-                    id,
-                    Kind::Duplicate {
-                        keep: keep_path.clone(),
-                    },
-                    risk,
-                    reason,
-                    Some(keep),
-                );
+                let kind = Kind::Duplicate {
+                    keep: keep_path.clone(),
+                };
+                let mut c = file_candidate(result, id, kind, verdict);
+                // The plan only runs while the kept copy is still what the scan saw.
+                c.action = c.action.keeping(&result.files[keep]);
                 c.hints.push(format!("behalten: {keep_rel}"));
                 taken.insert(id);
                 t.push(c);
@@ -574,49 +584,26 @@ pub fn assess(
                 t.protected += 1;
                 continue;
             }
-            let name = node.name();
-            let c = if ctx.project[d] {
-                dir_candidate(
-                    result,
-                    d,
-                    Kind::EmptyDir,
-                    Risk::Unsure,
-                    project_hint(result, ctx, d),
-                )
-            } else if name.starts_with('.') {
-                dir_candidate(
-                    result,
-                    d,
-                    Kind::EmptyDir,
-                    Risk::Unsure,
+            let verdict = if ctx.project[d] {
+                unsure(Doubt::Project, project_hint(result, ctx, d))
+            } else if node.name().starts_with('.') {
+                unsure(
+                    Doubt::Judgement,
                     "versteckter Ordner, oft von Programmen angelegt",
                 )
             } else {
                 match dir_age_days(&node.path, now) {
-                    Some(a) if a >= opts.empty_dir_min_age_days => dir_candidate(
-                        result,
-                        d,
-                        Kind::EmptyDir,
-                        Risk::Safe,
-                        format!("leer, seit {a} Tagen unverändert"),
-                    ),
-                    Some(a) => dir_candidate(
-                        result,
-                        d,
-                        Kind::EmptyDir,
-                        Risk::Unsure,
+                    Some(a) if a >= opts.empty_dir_min_age_days => {
+                        safe(format!("leer, seit {a} Tagen unverändert"))
+                    }
+                    Some(a) => unsure(
+                        Doubt::Verifiable,
                         format!("erst vor {a} Tagen angelegt oder geändert"),
                     ),
-                    None => dir_candidate(
-                        result,
-                        d,
-                        Kind::EmptyDir,
-                        Risk::Unsure,
-                        "Ordnerdatum nicht lesbar",
-                    ),
+                    None => unsure(Doubt::Verifiable, "Ordnerdatum nicht lesbar"),
                 }
             };
-            t.push(c);
+            t.push(dir_candidate(result, d, Kind::EmptyDir, verdict));
         }
     }
 
@@ -662,126 +649,106 @@ pub fn in_use(_path: &Path) -> Option<bool> {
     None
 }
 
-fn hash_file(path: &Path) -> Option<blake3::Hash> {
-    use std::io::Read;
-    let mut f = fs::File::open(path).ok()?;
-    let mut h = blake3::Hasher::new();
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = f.read(&mut buf).ok()?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-    }
-    Some(h.finalize())
-}
-
 /// Re-examine an unsure candidate with checks that cost I/O. Updates `risk` and `hints`.
-pub fn recheck(c: &mut Candidate, result: &ScanResult, ctx: &DirContext) -> Recheck {
-    let outcome = recheck_inner(c, result, ctx);
-    match &outcome {
+///
+/// What a re-check may conclude depends on why the candidate is unsure: "recently
+/// changed" is settled by an in-use test, "can be verified" by looking at the disk.
+/// Questions of intent and project membership stay with the user, whatever the disk says.
+pub fn recheck(c: &mut Candidate) -> Recheck {
+    let outcome = recheck_inner(c);
+    let msg = match &outcome {
         Recheck::Promoted(msg) => {
             c.risk = Risk::Safe;
-            c.hints.push(format!("Nachgeprüft: {msg}"));
+            c.doubt = None;
+            msg
         }
-        Recheck::StillUnsure(msg) => c.hints.push(format!("Nachgeprüft: {msg}")),
-        Recheck::Blocked(msg) => {
+        Recheck::StillUnsure(msg) => {
             c.risk = Risk::Unsure;
-            c.hints.push(format!("Nachgeprüft: {msg}"));
+            msg
         }
-    }
+        Recheck::Blocked(msg) => {
+            c.risk = Risk::Blocked;
+            msg
+        }
+    };
+    c.hints.push(format!("Nachgeprüft: {msg}"));
     outcome
 }
 
-fn recheck_inner(c: &Candidate, result: &ScanResult, ctx: &DirContext) -> Recheck {
+fn recheck_inner(c: &Candidate) -> Recheck {
     let src = &c.action.source;
-    if !c.action.is_dir {
-        if let Some(g) = &c.action.guard
-            && let Err(e) = g.check(src)
-        {
-            return Recheck::Blocked(e);
-        }
-        if in_use(src) == Some(true) {
-            return Recheck::Blocked("Datei ist gerade von einem Programm geöffnet".into());
-        }
+    if let Some(g) = &c.action.guard
+        && let Err(e) = g.check(src)
+    {
+        return Recheck::Blocked(e);
     }
-    let in_project = c
-        .file
-        .map(|f| ctx.project[result.files[f].parent])
-        .or_else(|| c.dir.map(|d| ctx.project[d]))
-        .unwrap_or(false);
+    let used = if c.action.is_dir { None } else { in_use(src) };
+    if used == Some(true) {
+        return Recheck::Blocked("Datei ist gerade von einem Programm geöffnet".into());
+    }
 
+    match c.doubt {
+        // Nothing was in doubt, and the checks above found nothing either.
+        None => Recheck::Promoted("unverändert und nicht in Benutzung".into()),
+        Some(Doubt::Project) => Recheck::StillUnsure(
+            "gehört zu einem Projekt und könnte versioniert oder von Werkzeugen erwartet sein. Bitte selbst entscheiden.".into(),
+        ),
+        Some(Doubt::Judgement) => Recheck::StillUnsure(match c.kind {
+            Kind::OldInstaller => "ob eine ausführbare Datei ein Installer oder ein portables Programm ist, lässt sich nicht automatisch entscheiden".into(),
+            Kind::Distribute => "ob die Dateien dieses Ordners zusammengehören, lässt sich nicht automatisch entscheiden".into(),
+            _ => "das lässt sich nicht automatisch entscheiden".into(),
+        }),
+        Some(Doubt::Recent) => match used {
+            Some(false) => Recheck::Promoted(
+                "seit dem Scan unverändert und von keinem Programm geöffnet".into(),
+            ),
+            _ => Recheck::StillUnsure(
+                "ob die Datei gerade benutzt wird, lässt sich auf diesem System nicht prüfen".into(),
+            ),
+        },
+        Some(Doubt::Verifiable) => verify(c),
+    }
+}
+
+/// Settle a [`Doubt::Verifiable`] candidate by looking at the disk.
+fn verify(c: &Candidate) -> Recheck {
+    let src = &c.action.source;
     match &c.kind {
-        Kind::Duplicate { keep } => {
-            if in_project {
-                return Recheck::StillUnsure(
-                    "Inhalt ist identisch, aber eine Kopie gehört zu einem Projekt. Bitte selbst entscheiden.".into(),
-                );
-            }
-            match (hash_file(src), hash_file(keep)) {
-                (Some(a), Some(b)) if a == b => {
-                    Recheck::Promoted("Inhalt erneut verglichen, byte-identisch mit der erhaltenen Kopie".into())
-                }
-                (Some(_), Some(_)) => Recheck::Blocked("Inhalt unterscheidet sich inzwischen von der erhaltenen Kopie".into()),
-                _ => Recheck::Blocked("eine der beiden Dateien ist nicht mehr lesbar".into()),
-            }
-        }
+        Kind::Duplicate { keep } => match (hash_full(src), hash_full(keep)) {
+            (Ok(a), Ok(b)) if a == b => Recheck::Promoted(
+                "Inhalt erneut verglichen, byte-identisch mit der erhaltenen Kopie".into(),
+            ),
+            (Ok(_), Ok(_)) => Recheck::Blocked(
+                "Inhalt unterscheidet sich inzwischen von der erhaltenen Kopie".into(),
+            ),
+            _ => Recheck::Blocked("eine der beiden Dateien ist nicht mehr lesbar".into()),
+        },
         Kind::ExtractedArchive | Kind::OldArchive => {
-            let stem = archive_stem(&src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
-            let sibling = src.parent().map(|p| p.join(&stem));
-            match sibling {
+            let name = src.file_name().unwrap_or_default().to_string_lossy();
+            match src.parent().map(|p| p.join(archive_stem(&name))) {
                 Some(dir) if dir.is_dir() => {
                     let n = fs::read_dir(&dir).map(|rd| rd.count()).unwrap_or(0);
                     if n > 0 {
-                        Recheck::Promoted(format!("entpackter Ordner {} vorhanden ({n} Einträge)", dir.display()))
+                        Recheck::Promoted(format!(
+                            "entpackter Ordner {} vorhanden ({n} Einträge)",
+                            dir.display()
+                        ))
                     } else {
-                        Recheck::StillUnsure("ein gleichnamiger Ordner existiert, ist aber leer".into())
+                        Recheck::StillUnsure(
+                            "ein gleichnamiger Ordner existiert, ist aber leer".into(),
+                        )
                     }
                 }
-                _ => Recheck::StillUnsure("kein entpackter Ordner gefunden, Inhalt wäre nur über das Archiv erreichbar".into()),
+                _ => Recheck::StillUnsure(
+                    "kein entpackter Ordner gefunden, der Inhalt wäre nur über das Archiv erreichbar"
+                        .into(),
+                ),
             }
         }
-        Kind::OfficeLock | Kind::PartialDownload => {
-            if in_project {
-                return Recheck::StillUnsure("gehört zu einem Projekt".into());
-            }
-            match in_use(src) {
-                Some(false) => Recheck::Promoted("von keinem Programm geöffnet".into()),
-                Some(true) => Recheck::Blocked("gerade geöffnet".into()),
-                None => Recheck::StillUnsure("Benutzungsprüfung auf diesem System nicht verfügbar".into()),
-            }
+        // The guard has just confirmed that there is no file below it.
+        Kind::EmptyDir | Kind::LeftoverDir => {
+            Recheck::Promoted("auf der Platte weiterhin leer".into())
         }
-        Kind::Junk | Kind::ZeroByte => {
-            if in_project {
-                Recheck::StillUnsure("liegt in einem Projekt, könnte versioniert sein".into())
-            } else if in_use(src) == Some(false) {
-                Recheck::Promoted("von keinem Programm geöffnet".into())
-            } else {
-                Recheck::StillUnsure("Alter unter dem Schwellwert, kein weiterer Hinweis".into())
-            }
-        }
-        Kind::EmptyDir => {
-            if in_project {
-                Recheck::StillUnsure("leerer Ordner in einem Projekt, Werkzeuge erwarten ihn vielleicht".into())
-            } else if fs::read_dir(src).map(|rd| rd.count()).unwrap_or(1) == 0 {
-                Recheck::Promoted("auf der Platte weiterhin leer".into())
-            } else {
-                Recheck::Blocked("ist inzwischen nicht mehr leer".into())
-            }
-        }
-        Kind::OldInstaller => Recheck::StillUnsure(
-            "ob eine .exe ein Installer oder ein portables Programm ist, lässt sich nicht automatisch entscheiden".into(),
-        ),
-        Kind::Sort { .. } | Kind::MoveFolder { .. } | Kind::Distribute | Kind::LeftoverDir => {
-            if in_project {
-                Recheck::StillUnsure("gehört zu einem Projekt".into())
-            } else {
-                match in_use(src) {
-                    Some(true) => Recheck::Blocked("gerade geöffnet".into()),
-                    _ => Recheck::Promoted("nicht in Benutzung, kann verschoben werden".into()),
-                }
-            }
-        }
+        _ => Recheck::StillUnsure("dafür gibt es keine automatische Prüfung".into()),
     }
 }

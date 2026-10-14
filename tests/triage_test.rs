@@ -7,7 +7,7 @@ use std::time::SystemTime;
 use common::Fixture;
 use tidyscan::dupes::find_duplicates;
 use tidyscan::scan::{ScanOptions, scan_simple};
-use tidyscan::triage::{self, Kind, Recheck, Risk, Triage, TriageOptions, archive_stem};
+use tidyscan::triage::{self, Doubt, Kind, Recheck, Risk, Triage, TriageOptions, archive_stem};
 
 fn names(list: &[triage::Candidate]) -> Vec<String> {
     let mut v: Vec<String> = list
@@ -202,37 +202,82 @@ fn recheck_promotes_duplicates_and_blocks_changed_files() {
     fx.age(&a, 20);
     fx.age(&b, 20);
 
-    let (r, mut t) = run(&fx, true);
-    let ctx = common::ctx(&r);
+    let (_r, mut t) = run(&fx, true);
     let c = t
         .unsure
         .iter_mut()
         .find(|c| matches!(c.kind, Kind::Duplicate { .. }))
         .unwrap();
     // Project membership keeps it unsure even though the content matches.
-    assert!(matches!(
-        triage::recheck(c, &r, &ctx),
-        Recheck::StillUnsure(_)
-    ));
+    assert_eq!(c.doubt, Some(Doubt::Project));
+    assert!(matches!(triage::recheck(c), Recheck::StillUnsure(_)));
     assert_eq!(c.risk, Risk::Unsure);
 
     // A young lock file promoted once it is not in use, blocked once it changed.
     let fx2 = Fixture::new();
     let lock = fx2.file("~$doc.docx", b"x");
     let (r2, mut t2) = run(&fx2, false);
-    let ctx2 = common::ctx(&r2);
     let c = &mut t2.unsure[0];
-    let outcome = triage::recheck(c, &r2, &ctx2);
+    assert_eq!(c.doubt, Some(Doubt::Recent));
+    let outcome = triage::recheck(c);
     if cfg!(windows) {
         assert!(matches!(outcome, Recheck::Promoted(_)), "{outcome:?}");
         assert_eq!(c.risk, Risk::Safe);
+    } else {
+        // Without an in-use test nothing speaks for it: it stays a question.
+        assert!(matches!(outcome, Recheck::StillUnsure(_)), "{outcome:?}");
+        assert_eq!(c.risk, Risk::Unsure);
     }
     std::fs::write(&lock, b"changed!").unwrap();
-    assert!(matches!(
-        triage::recheck(c, &r2, &ctx2),
-        Recheck::Blocked(_)
-    ));
-    assert_eq!(c.risk, Risk::Unsure);
+    assert!(matches!(triage::recheck(c), Recheck::Blocked(_)));
+    assert_eq!(c.risk, Risk::Blocked);
+
+    // Blocked means blocked: not even "include everything unsure" plans it.
+    assert!(t2.to_plan(&r2.root, true).is_empty());
+}
+
+#[test]
+fn recheck_never_settles_questions_of_intent() {
+    let fx = Fixture::new();
+    let tool = fx.file("Tools/tool.exe", b"MZ");
+    fx.age(&tool, 200);
+    let nested = fx.file("Downloads/Programm/start.exe", b"MZ");
+    fx.age(&nested, 200);
+    let keep = fx.file("notizen/.keep", b"");
+    fx.age(&keep, 200);
+
+    let (_r, mut t) = run(&fx, false);
+    assert!(t.safe.is_empty(), "{:?}", names(&t.safe));
+    assert_eq!(names(&t.unsure), vec![".keep", "start.exe", "tool.exe"]);
+    for c in &mut t.unsure {
+        assert_eq!(c.doubt, Some(Doubt::Judgement), "{}", c.reason);
+        // The file is old, unchanged and not open. That answers nothing here.
+        assert!(matches!(triage::recheck(c), Recheck::StillUnsure(_)));
+        assert_eq!(c.risk, Risk::Unsure);
+    }
+}
+
+#[test]
+fn names_without_a_dot_are_not_junk() {
+    let fx = Fixture::new();
+    for name in [
+        "download",
+        "temp",
+        "tmp",
+        "part",
+        "partial",
+        "Downloads/download",
+    ] {
+        let p = fx.file(name, b"wichtige Daten");
+        fx.age(&p, 60);
+    }
+    let real = fx.file("film.mkv.part", b"x");
+    fx.age(&real, 60);
+
+    let (_r, t) = run(&fx, false);
+    assert_eq!(names(&t.safe), vec!["film.mkv.part"]);
+    assert!(t.unsure.is_empty(), "{:?}", names(&t.unsure));
+    assert!(triage::is_junk_name("x.TMP") && !triage::is_junk_name("tmp"));
 }
 
 #[cfg(windows)]

@@ -12,9 +12,7 @@ use crate::analysis::human;
 use crate::context::{self, DirContext};
 use crate::dupes::DupeGroup;
 use crate::model::ScanResult;
-use crate::organize::{
-    self, AfterTree, FolderProfile, FolderVerdict, OrganizeOptions, OrganizePlan,
-};
+use crate::organize::{self, AfterTree, FolderProfile, OrganizeOptions, OrganizePlan};
 use crate::triage::{self, Candidate, Recheck, Risk, Triage, TriageOptions};
 
 const MAX_ROWS_PER_GROUP: usize = 300;
@@ -93,6 +91,11 @@ impl AutoState {
         self.job.is_some() || self.waiting_for_dupes.is_some() || self.recheck.is_some()
     }
 
+    /// Whether an item may be ticked at all.
+    fn selectable(item: &Item) -> bool {
+        item.cand.risk != Risk::Blocked
+    }
+
     fn safe_items(&self) -> impl Iterator<Item = (usize, &Item)> {
         self.items
             .iter()
@@ -109,7 +112,11 @@ impl AutoState {
 
     fn checked_plan(&self, root: &std::path::Path) -> Plan {
         let mut plan = Plan::new(root);
-        for i in self.items.iter().filter(|i| i.checked) {
+        for i in self
+            .items
+            .iter()
+            .filter(|i| i.checked && Self::selectable(i))
+        {
             plan.push(i.cand.action.clone());
         }
         plan.dedup();
@@ -248,10 +255,7 @@ pub fn poll(app: &mut App) {
 }
 
 fn start_recheck(app: &mut App, indices: Vec<usize>) {
-    let (Some(result), Some(ctx)) = (app.result.clone(), app.auto.ctx.clone()) else {
-        return;
-    };
-    if indices.is_empty() {
+    if app.result.is_none() || indices.is_empty() {
         return;
     }
     let work: Vec<(usize, Candidate)> = indices
@@ -262,7 +266,7 @@ fn start_recheck(app: &mut App, indices: Vec<usize>) {
     let total = work.len();
     std::thread::spawn(move || {
         for (idx, mut cand) in work {
-            let outcome = triage::recheck(&mut cand, &result, &ctx);
+            let outcome = triage::recheck(&mut cand);
             let _ = tx.send((idx, cand, outcome));
         }
     });
@@ -431,13 +435,7 @@ fn before_after(app: &mut App, result: &ScanResult, ui: &mut Ui) {
                                 .profiles
                                 .iter()
                                 .find(|p| result.dirs[p.dir].path == d.path)
-                                .map(|p| match &p.verdict {
-                                    FolderVerdict::Keep(w) if w.is_empty() => "bleibt".to_string(),
-                                    FolderVerdict::Keep(w) => format!("bleibt: {w}"),
-                                    FolderVerdict::MoveWhole(c) => format!("nach {}", c.label()),
-                                    FolderVerdict::Distribute => "gemischt (unsicher)".into(),
-                                    FolderVerdict::Unsure(w) => format!("unsicher: {w}"),
-                                })
+                                .map(|p| p.verdict.describe())
                                 .unwrap_or_default();
                             ui.label(format!(
                                 "{}/   {} Dateien, {}   {}",
@@ -522,7 +520,11 @@ fn row(
         )
     };
     ui.horizontal(|ui| {
-        ui.checkbox(&mut app.auto.items[idx].checked, "");
+        let selectable = AutoState::selectable(&app.auto.items[idx]);
+        ui.add_enabled(
+            selectable,
+            egui::Checkbox::without_text(&mut app.auto.items[idx].checked),
+        );
         ui.label(if is_dir {
             "Ordner".to_string()
         } else {
@@ -654,7 +656,7 @@ fn unsure_section(app: &mut App, result: &ScanResult, ui: &mut Ui, busy: bool) {
                     }
                     if ui.small_button("Alle an").clicked() {
                         for &i in &idx {
-                            app.auto.items[i].checked = true;
+                            app.auto.items[i].checked = AutoState::selectable(&app.auto.items[i]);
                         }
                     }
                     if ui.small_button("Alle aus").clicked() {

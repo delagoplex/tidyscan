@@ -326,9 +326,13 @@ pub fn run(cli: Cli) -> anyhow::Result<Option<Option<PathBuf>>> {
         }) => {
             let compiled = rules::load_rules(&rules_path)?;
             let result = scan.run()?;
-            let mut plan = rules::apply_rules(&result, &compiled, now);
-            plan.dedup();
+            let ctx = context::build(&result);
+            let matches = rules::apply_rules(&result, &ctx, &compiled, now);
+            let plan = matches.plan.clone();
             print_plan(&plan);
+            if let Some(note) = matches.left_out() {
+                println!("{note}");
+            }
             finish_auto(&plan, apply)?;
         }
         Some(Command::Undo { journal, root }) => {

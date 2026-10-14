@@ -5,7 +5,6 @@ use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
 
 use common::Fixture;
-use tidyscan::context;
 use tidyscan::dupes::find_duplicates;
 use tidyscan::scan::{ScanOptions, scan_simple};
 use tidyscan::triage::{self, Kind, Recheck, Risk, Triage, TriageOptions, archive_stem};
@@ -28,7 +27,7 @@ fn names(list: &[triage::Candidate]) -> Vec<String> {
 
 fn run(fx: &Fixture, with_dupes: bool) -> (tidyscan::model::ScanResult, Triage) {
     let r = scan_simple(&fx.root(), &ScanOptions::default()).unwrap();
-    let ctx = context::build(&r);
+    let ctx = common::ctx(&r);
     let dupes = with_dupes.then(|| find_duplicates(&r, 1, Arc::new(AtomicBool::new(false)), None));
     let t = triage::assess(
         &r,
@@ -186,7 +185,7 @@ fn protected_root_yields_nothing() {
     fx.file("node_modules/pkg/Thumbs.db", b"x");
     let root = fx.root().join("node_modules");
     let r = scan_simple(&root, &ScanOptions::default()).unwrap();
-    let ctx = context::build(&r);
+    let ctx = common::ctx(&r);
     assert!(ctx.root_protected);
     let t = triage::assess(&r, &ctx, None, &TriageOptions::default(), SystemTime::now());
     assert!(t.safe.is_empty() && t.unsure.is_empty());
@@ -204,7 +203,7 @@ fn recheck_promotes_duplicates_and_blocks_changed_files() {
     fx.age(&b, 20);
 
     let (r, mut t) = run(&fx, true);
-    let ctx = context::build(&r);
+    let ctx = common::ctx(&r);
     let c = t
         .unsure
         .iter_mut()
@@ -221,7 +220,7 @@ fn recheck_promotes_duplicates_and_blocks_changed_files() {
     let fx2 = Fixture::new();
     let lock = fx2.file("~$doc.docx", b"x");
     let (r2, mut t2) = run(&fx2, false);
-    let ctx2 = context::build(&r2);
+    let ctx2 = common::ctx(&r2);
     let c = &mut t2.unsure[0];
     let outcome = triage::recheck(c, &r2, &ctx2);
     if cfg!(windows) {

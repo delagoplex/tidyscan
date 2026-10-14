@@ -1,5 +1,8 @@
 # Beispielregeln für tidyscan. Die erste passende Regel gewinnt.
 # Größen: 500, 10K, 1.5M, 2G. Platzhalter in move_to: {year} {month} {ext} {name}.
+# Globs sind relativ zum gescannten Ordner: * bleibt innerhalb eines Ordners,
+# ** geht über Ordnergrenzen. Geschützte Bereiche werden nie angefasst, Projektordner
+# nur mit include_projects = true.
 
 [[rule]]
 name = "Alte Installer in Quarantäne"
@@ -16,11 +19,12 @@ action = "quarantine"
 
 [[rule]]
 name = "Screenshots nach Jahr archivieren"
-glob = "**/Screenshot*"
+glob = "**/Screenshot*.png"
 older_than_days = 30
 action = "move"
 move_to = "Archiv/Screenshots/{year}"
 
+# Greift nur, wenn direkt im gescannten Ordner ein Ordner "Downloads" liegt.
 [[rule]]
 name = "Alte Downloads sortieren"
 glob = "Downloads/**"

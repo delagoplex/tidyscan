@@ -13,16 +13,20 @@
 //! action = "move"
 //! move_to = "Archiv/Screenshots/{year}"
 //! ```
+//!
+//! Rules never reach into protected areas, and into projects only when a rule says
+//! `include_projects = true`.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, bail};
-use globset::{Glob, GlobMatcher};
+use globset::{GlobBuilder, GlobMatcher};
 use serde::{Deserialize, Serialize};
 
-use crate::actions::{Action, ActionKind, Guard, Plan};
+use crate::actions::{Action, Plan};
 use crate::analysis::Category;
+use crate::context::DirContext;
 use crate::model::{FileEntry, ScanResult, local_datetime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +54,10 @@ pub struct Rule {
     pub action: RuleAction,
     #[serde(default)]
     pub move_to: Option<String>,
+    /// Also apply inside software projects. Off by default: a rule like "old archives"
+    /// should not pull release artefacts out of a repository.
+    #[serde(default)]
+    pub include_projects: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -117,7 +125,11 @@ impl CompiledRule {
         }
         let glob = match &rule.glob {
             Some(g) => Some(
-                Glob::new(g)
+                // `*` stays within one folder, only `**` crosses folder boundaries.
+                // Otherwise "Screenshot*" would swallow everything below "Screenshots/".
+                GlobBuilder::new(g)
+                    .literal_separator(true)
+                    .build()
                     .with_context(|| format!("Regel '{}': ungültiges Glob", rule.name))?
                     .compile_matcher(),
             ),
@@ -147,7 +159,7 @@ impl CompiledRule {
         if let Some(g) = &self.glob {
             // Match against a forward-slashed relative path so rules are portable.
             let rel = relative.to_string_lossy().replace('\\', "/");
-            if !g.is_match(&rel) && !g.is_match(relative) {
+            if !g.is_match(&rel) {
                 return false;
             }
         }
@@ -188,8 +200,17 @@ impl CompiledRule {
             .replace("{month}", &month)
             .replace("{ext}", &file.extension().unwrap_or_default())
             .replace("{name}", &file.name());
-        // Templates use forward slashes; rebuild from components so the result
-        // uses the platform separator.
+        // Templates use forward slashes. A relative target is rebuilt from its
+        // components so it uses the platform separator; an absolute one (another
+        // drive, a network share) must keep its root and is taken as written.
+        let native = if cfg!(windows) {
+            out.replace('/', "\\")
+        } else {
+            out.clone()
+        };
+        if Path::new(&native).is_absolute() || native.starts_with(['/', '\\']) {
+            return Some(PathBuf::from(native));
+        }
         Some(
             out.split(['/', '\\'])
                 .filter(|c| !c.is_empty())
@@ -212,35 +233,75 @@ pub fn parse_rules(text: &str) -> anyhow::Result<Vec<CompiledRule>> {
     file.rule.into_iter().map(CompiledRule::compile).collect()
 }
 
+/// Result of applying rules: the plan, and how many matches were left alone.
+#[derive(Debug, Clone)]
+pub struct RuleMatches {
+    pub plan: Plan,
+    /// Matches inside protected areas, which no rule can reach.
+    pub protected: usize,
+    /// Matches inside projects for rules without `include_projects`.
+    pub in_projects: usize,
+}
+
 /// Build a plan by applying the first matching rule to every file.
-pub fn apply_rules(result: &ScanResult, rules: &[CompiledRule], now: SystemTime) -> Plan {
-    let mut plan = Plan::new(&result.root);
+pub fn apply_rules(
+    result: &ScanResult,
+    ctx: &DirContext,
+    rules: &[CompiledRule],
+    now: SystemTime,
+) -> RuleMatches {
+    let mut out = RuleMatches {
+        plan: Plan::new(&result.root),
+        protected: 0,
+        in_projects: 0,
+    };
     for file in &result.files {
         let rel = result.relative(&file.path);
         let Some(rule) = rules.iter().find(|r| r.matches(file, &rel, now)) else {
             continue;
         };
-        let kind = match rule.rule.action {
-            RuleAction::Quarantine => ActionKind::Quarantine,
+        if ctx.protected[file.parent] {
+            out.protected += 1;
+            continue;
+        }
+        if ctx.project[file.parent] && !rule.rule.include_projects {
+            out.in_projects += 1;
+            continue;
+        }
+        let action = match rule.rule.action {
+            RuleAction::Quarantine => Action::quarantine_file(file, &rule.rule.name),
             RuleAction::Move => match rule.target_for(file) {
-                Some(t) => ActionKind::MoveTo(t),
+                Some(t) => Action::move_file(file, t, &rule.rule.name),
                 None => continue,
             },
         };
-        plan.push(Action {
-            source: file.path.clone(),
-            is_dir: false,
-            size: file.size,
-            kind,
-            reason: rule.rule.name.clone(),
-            guard: Some(Guard::for_file(file)),
-        });
+        out.plan.push(action);
     }
-    plan
+    out
+}
+
+impl RuleMatches {
+    /// One line about what was left out, or `None` when nothing was.
+    pub fn left_out(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.protected > 0 {
+            parts.push(format!("{} in geschützten Bereichen", self.protected));
+        }
+        if self.in_projects > 0 {
+            parts.push(format!(
+                "{} in Projektordnern (include_projects = true schließt sie ein)",
+                self.in_projects
+            ));
+        }
+        (!parts.is_empty()).then(|| format!("Nicht übernommen: {}.", parts.join(", ")))
+    }
 }
 
 pub const EXAMPLE_RULES: &str = r#"# Beispielregeln für tidyscan. Die erste passende Regel gewinnt.
 # Größen: 500, 10K, 1.5M, 2G. Platzhalter in move_to: {year} {month} {ext} {name}.
+# Globs sind relativ zum gescannten Ordner: * bleibt innerhalb eines Ordners,
+# ** geht über Ordnergrenzen. Geschützte Bereiche werden nie angefasst, Projektordner
+# nur mit include_projects = true.
 
 [[rule]]
 name = "Alte Installer in Quarantäne"
@@ -257,11 +318,12 @@ action = "quarantine"
 
 [[rule]]
 name = "Screenshots nach Jahr archivieren"
-glob = "**/Screenshot*"
+glob = "**/Screenshot*.png"
 older_than_days = 30
 action = "move"
 move_to = "Archiv/Screenshots/{year}"
 
+# Greift nur, wenn direkt im gescannten Ordner ein Ordner "Downloads" liegt.
 [[rule]]
 name = "Alte Downloads sortieren"
 glob = "Downloads/**"

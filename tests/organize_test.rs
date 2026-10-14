@@ -5,7 +5,6 @@ use std::time::SystemTime;
 use common::Fixture;
 use tidyscan::actions::ActionKind;
 use tidyscan::analysis::Category;
-use tidyscan::context;
 use tidyscan::organize::{self, FolderVerdict, OrganizeOptions};
 use tidyscan::scan::{ScanOptions, scan_simple};
 use tidyscan::triage::{Candidate, Kind, Risk};
@@ -31,7 +30,7 @@ fn plan(
     opts: &OrganizeOptions,
 ) -> (tidyscan::model::ScanResult, organize::OrganizePlan) {
     let r = scan_simple(&fx.root(), &ScanOptions::default()).unwrap();
-    let ctx = context::build(&r);
+    let ctx = common::ctx(&r);
     let p = organize::plan_organize(&r, &ctx, opts, SystemTime::now());
     (r, p)
 }

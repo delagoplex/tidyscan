@@ -5,6 +5,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use tempfile::TempDir;
+use tidyscan::context::{self, DirContext, Environment};
+use tidyscan::model::ScanResult;
+
+/// Context from the scanned tree alone, independent of the machine the tests run on
+/// (what lies above the temp folder, which system areas exist).
+pub fn ctx(result: &ScanResult) -> DirContext {
+    context::build_in(result, &Environment::isolated())
+}
 
 pub struct Fixture {
     pub dir: TempDir,

@@ -74,7 +74,7 @@ action = "quarantine"
     assert_eq!(rules.len(), 3);
 
     let r = scan_simple(&fx.root(), &ScanOptions::default()).unwrap();
-    let plan = apply_rules(&r, &rules, SystemTime::now());
+    let plan = apply_rules(&r, &common::ctx(&r), &rules, SystemTime::now()).plan;
     let mut hits: Vec<(String, String)> = plan
         .actions
         .iter()
@@ -639,4 +639,117 @@ fn actions_with_dates_before_1970_serialize() {
     let back: Action = serde_json::from_str(&json).unwrap();
     assert_eq!(back.guard, action.guard);
     serde_json::to_string(&r).expect("scan result serializes as well");
+}
+
+#[test]
+fn rules_leave_projects_and_protected_folders_alone() {
+    let fx = Fixture::new();
+    for name in [
+        "lose/alt.zip",
+        "spiel/release/build.zip",
+        "spiel/node_modules/pkg/dist.zip",
+    ] {
+        let p = fx.file(name, &[0u8; 10]);
+        fx.age(&p, 400);
+    }
+    fx.file("spiel/package.json", b"{}");
+    let r = scan_simple(&fx.root(), &ScanOptions::default()).unwrap();
+    let ctx = common::ctx(&r);
+    let rule = |extra: &str| {
+        parse_rules(&format!(
+            "[[rule]]\nname = \"zips\"\next = [\"zip\"]\naction = \"quarantine\"\n{extra}"
+        ))
+        .unwrap()
+    };
+    let names = |m: &tidyscan::rules::RuleMatches| -> Vec<String> {
+        let mut v: Vec<String> = m
+            .plan
+            .actions
+            .iter()
+            .map(|a| a.source.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+
+    let m = apply_rules(&r, &ctx, &rule(""), SystemTime::now());
+    assert_eq!(names(&m), vec!["alt.zip"]);
+    assert_eq!((m.in_projects, m.protected), (1, 1));
+    assert!(m.left_out().unwrap().contains("Projektordnern"));
+
+    // Opting in reaches the project, never the protected folder inside it.
+    let m = apply_rules(
+        &r,
+        &ctx,
+        &rule("include_projects = true"),
+        SystemTime::now(),
+    );
+    assert_eq!(names(&m), vec!["alt.zip", "build.zip"]);
+    assert_eq!((m.in_projects, m.protected), (0, 1));
+}
+
+#[test]
+fn globs_do_not_cross_folder_boundaries_unless_asked() {
+    let fx = Fixture::new();
+    fx.file("Screenshot 1.png", b"x");
+    fx.file("Bilder/Screenshot 2.png", b"x");
+    fx.file("Screenshots/2024/urlaub.png", b"x");
+    fx.file("Downloads/a.bin", b"x");
+    fx.file("Downloads/tief/b.bin", b"x");
+    let r = scan_simple(&fx.root(), &ScanOptions::default()).unwrap();
+    let ctx = common::ctx(&r);
+    let hits = |glob: &str| -> Vec<String> {
+        let rules = parse_rules(&format!(
+            "[[rule]]\nname = \"g\"\nglob = \"{glob}\"\naction = \"quarantine\""
+        ))
+        .unwrap();
+        let mut v: Vec<String> = apply_rules(&r, &ctx, &rules, SystemTime::now())
+            .plan
+            .actions
+            .iter()
+            .map(|a| a.source.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        hits("**/Screenshot*"),
+        vec!["Screenshot 1.png", "Screenshot 2.png"],
+        "nothing below the folder 'Screenshots'"
+    );
+    assert_eq!(hits("Screenshot*"), vec!["Screenshot 1.png"]);
+    assert_eq!(hits("Downloads/*"), vec!["a.bin"]);
+    assert_eq!(hits("Downloads/**"), vec!["a.bin", "b.bin"]);
+}
+
+#[test]
+fn absolute_move_targets_keep_their_root() {
+    let fx = Fixture::new();
+    let other = Fixture::new();
+    let src = fx.file("a.pdf", b"x");
+    let target = other.root().join("Archiv");
+    let rules = parse_rules(&format!(
+        "[[rule]]\nname = \"m\"\next = [\"pdf\"]\naction = \"move\"\nmove_to = \"{}/{{ext}}\"",
+        target.to_string_lossy().replace('\\', "/")
+    ))
+    .unwrap();
+    let r = scan_simple(&fx.root(), &ScanOptions::default()).unwrap();
+    let plan = apply_rules(&r, &common::ctx(&r), &rules, SystemTime::now()).plan;
+    match &plan.actions[0].kind {
+        ActionKind::MoveTo(p) => assert_eq!(p, &target.join("pdf")),
+        ActionKind::Quarantine => panic!("expected move"),
+    }
+    let rep = actions::execute(&plan, false).unwrap();
+    assert_eq!(rep.moved, 1, "{:?} {:?}", rep.failed, rep.skipped);
+    assert!(target.join("pdf/a.pdf").exists() && !src.exists());
+    assert!(
+        !fx.root().join("Archiv").exists(),
+        "not rebuilt below the scan root"
+    );
+
+    assert_eq!(
+        actions::undo(&rep.journal_path.unwrap()).unwrap().restored,
+        1
+    );
+    assert!(src.exists());
 }

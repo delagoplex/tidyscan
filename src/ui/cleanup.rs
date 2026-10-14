@@ -165,13 +165,15 @@ fn apply_rules(app: &mut App) {
     app.rules_error = None;
     match rules::load_rules(std::path::Path::new(app.rules_path.trim())) {
         Ok(compiled) => {
-            let plan = rules::apply_rules(&result, &compiled, SystemTime::now());
-            let n = plan.len();
-            for a in plan.actions {
+            let ctx = crate::context::build(&result);
+            let matches = rules::apply_rules(&result, &ctx, &compiled, SystemTime::now());
+            let n = matches.plan.len();
+            let note = matches.left_out().unwrap_or_default();
+            for a in matches.plan.actions {
                 app.selection.insert(a);
             }
             app.status = format!(
-                "{n} Treffer aus {} Regeln in den Plan übernommen.",
+                "{n} Treffer aus {} Regeln in den Plan übernommen. {note}",
                 compiled.len()
             );
         }

@@ -350,7 +350,7 @@ pub fn plan_organize(
 
         // A downloads folder is a dumping ground: its direct files count as loose,
         // its subfolders are judged on their own.
-        if ctx.downloads[d] && ctx.category_folder[d].is_none() && node.parent == Some(0) {
+        if ctx.downloads_root[d] && ctx.category_folder[d].is_none() {
             sort_loose_files(
                 result,
                 &node.files,

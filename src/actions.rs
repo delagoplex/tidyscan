@@ -1077,3 +1077,77 @@ pub fn list_journals(root: &Path) -> Vec<PathBuf> {
     v.reverse();
     v
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The copy path only runs across devices, which a test cannot arrange, so its
+    /// building blocks are exercised directly.
+    #[test]
+    fn copy_tree_is_complete_and_keeps_timestamps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("from");
+        fs::create_dir_all(from.join("a/b")).unwrap();
+        fs::create_dir(from.join("leer")).unwrap();
+        fs::write(from.join("x.bin"), [1u8; 2000]).unwrap();
+        fs::write(from.join("a/b/y.txt"), b"y").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(100 * 86_400);
+        let ft = filetime::FileTime::from_system_time(old);
+        filetime::set_file_times(from.join("x.bin"), ft, ft).unwrap();
+
+        let to = tmp.path().join("to");
+        copy_tree(&from, &to).unwrap();
+        assert_eq!(fs::read(to.join("x.bin")).unwrap(), vec![1u8; 2000]);
+        assert_eq!(fs::read(to.join("a/b/y.txt")).unwrap(), b"y");
+        assert!(to.join("leer").is_dir());
+        let copied = fs::metadata(to.join("x.bin")).unwrap().modified().unwrap();
+        assert!(same_instant(old, copied), "a restored file keeps its date");
+
+        // It never merges into something that is already there.
+        assert!(copy_tree(&from, &to).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_refuses_links_instead_of_dropping_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("from");
+        fs::create_dir(&from).unwrap();
+        fs::write(from.join("x"), b"x").unwrap();
+        std::os::unix::fs::symlink(from.join("x"), from.join("link")).unwrap();
+        assert!(copy_tree(&from, &tmp.path().join("to")).is_err());
+        assert!(from.join("link").exists() && from.join("x").exists());
+    }
+
+    #[test]
+    fn transfer_never_replaces_an_existing_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        fs::write(&a, b"neu").unwrap();
+        fs::write(&b, b"alt").unwrap();
+        let err = transfer(&a, &b, false).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&a).unwrap(), b"neu");
+        assert_eq!(fs::read(&b).unwrap(), b"alt");
+    }
+
+    #[test]
+    fn collision_suffix_respects_the_kind_of_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("bericht.v2.pdf"), b"x").unwrap();
+        fs::create_dir(tmp.path().join("bericht.v2")).unwrap();
+        fs::write(tmp.path().join("LIESMICH"), b"x").unwrap();
+        let name = |p: &str, is_dir| {
+            unique_destination(tmp.path().join(p), is_dir)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert_eq!(name("bericht.v2.pdf", false), "bericht.v2 (1).pdf");
+        assert_eq!(name("bericht.v2", true), "bericht.v2 (1)");
+        assert_eq!(name("LIESMICH", false), "LIESMICH (1)");
+        assert_eq!(name("frei.txt", false), "frei.txt");
+    }
+}
